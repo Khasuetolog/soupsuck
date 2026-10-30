@@ -965,3 +965,226 @@ CE forward/entropy вычисляются и для padding. Packed head — о�
 4. Профиль реального SDPA backend, числа SDPA вызовов, host sync, dropout
    scatter/gather, cat и остаточной padded CE. Не фиксировать backend ради
    хорошего профиля и не переносить сюда результаты ce1ff09 автоматически.
+
+## S-030 — async MLP offload и partial recompute S-025
+
+Дата: 2026-10-30. Проверен **только коммит
+`796bf0e2940de90df94b497dd52c6f8b3d0a6a73`**: `solution/mlp.py` и
+`solution/tests/test_mlp.py`, с чтением вызываемого SwiGLU backward.
+Строки ниже относятся к `git show 796bf0e:<path>`, не к checkout.
+Изменён только отчёт; коммитов, исправлений кода и Kaggle-запусков нет.
+
+**Итог:** доказанного нового P0/P1 для штатного последовательного Qwen2
+forward/backward не найдено. D2H/H2D и повторное использование upload/staging
+имеют явные event-зависимости; host leases и weak links разделяют lifetime
+CPU activation data и графов. Обнаружены P2 по границе concurrent replay,
+неполному stress acceptance и цене фиксированной reservation. Всё CUDA
+поведение, скорость/пики памяти и совместный unpad-прогон здесь UNVERIFIED.
+Default store математически не изменён; оба новых режима opt-in.
+
+### Источники и выполненные проверки
+
+- Снимок: `git show 796bf0e:solution/mlp.py`, `:solution/tests/test_mlp.py`,
+  `:solution/kernels/swiglu_fused.py:67-78`; diff относительно родителя.
+- Локальная копия torch 2.11 `torch/csrc/autograd/init.cpp:516-518`
+  (`/private/tmp/featherduster-torch-autograd-init.cpp`) подтверждает binding
+  `_get_current_graph_task_keep_graph` в `torch._C._autograd`.
+- [PyTorch 2.11 CUDA stream semantics](https://docs.pytorch.org/docs/2.11/notes/cuda.html#cuda-streams)
+  и [Tensor.record_stream](https://docs.pytorch.org/docs/2.11/generated/torch.Tensor.record_stream.html):
+  порядок разных streams требует зависимостей; allocator tracking защищает
+  lifetime, но не заменяет event wait перед чтением/перезаписью. CUDA backward
+  op использует stream соответствующего forward op; consumer gradients на
+  другом stream всё равно должен синхронизировать вызывающий код.
+
+Неизменный `git archive 796bf0e solution` распакован во временный каталог.
+Python syntax compilation обоих review-target файлов прошла без исполнения.
+Команда в этом каталоге:
+
+```text
+/private/tmp/s004-integration-venv/bin/python -m pytest solution/tests/test_mlp.py -q -rs
+SKIPPED solution/tests/test_mlp.py:8: No module named 'torch'
+1 skipped in 0.08s; exit code 5 (нет собранных исполнимых тестов)
+```
+
+Это **не PASS численных тестов**. Torch/CUDA/bnb локально отсутствуют;
+не было ни измерения памяти, ни stress проверки реальных CUDA events.
+
+### P2-030-1 — одновременный replay одного ticket не имеет отдельного ownership
+
+- **Файл:строка:** `solution/mlp.py:162-169`, `:214-242`, `:414-443`.
+- Последовательный retain/replay поддержан, но ticket хранит ровно один
+  `device_slot` и `compute_stream`. Повторный `begin_backward` при уже
+  используемом slot просто возвращает тот же slot и переписывает stream;
+  отдельного per-invocation reader count или запрета reentry нет.
+- Допустимое на уровне Python state-machine чередование двух backward
+  одного retained ctx: A и B вызвали begin; A получил tensors и вызвал
+  release_device; B ещё не вызвал tensors. A очищает ticket.device_slot,
+  затем B обращается к `slot.ready` у None. Если B уже получил views,
+  первый release снимает in_use до завершения второго читателя и позволяет
+  pool назначить slot другому ticket. Pool RLock защищает отдельные методы,
+  но не весь begin→read→release интервал одного reader.
+- Это статическая граница, **не воспроизведённая CUDA гонка**. Обычный Soup
+  запускает последовательный backward; serial repeated backward с retain
+  её не вызывает. Упомянутые в коде независимые concurrent backward graphs
+  имеют разные tickets и не тождественны concurrent replay одного ctx.
+  PyTorch обычно направляет CUDA backward этого узла на его forward stream,
+  поэтому различие stream IDs само по себе не служит доказательством гонки.
+- **Минимальный фикс:** явно запретить overlapping begin одного ticket
+  до release (понятная ошибка до использования buffer) либо вести ownership
+  для каждого reader и ждать всех completion events перед eviction.
+  Задокументировать serial-only replay, если concurrency не входит в контракт.
+- **Влияние:** robustness нестандартного многопоточного autograd; не доказанный
+  дефект training checks и не основание менять default store.
+
+### P2-030-2 — stress-тесты не проверяют ключевые нештатные переходы пула
+
+- **Файл:строка:** `solution/tests/test_mlp.py:226-271`, `:310-356`, `:376-392`.
+- Есть хорошие проверки bits/gradient относительно store, serial retained
+  backward, повторного использования host pointers при разных lengths,
+  multilayer prefetch/peak и call counts partial recompute. Но нет явных
+  тестов out-of-order branches, eviction speculative prefetch, двух
+  одновременно живых retained graphs, growth→retirement при rows>capacity,
+  graph destruction до завершения D2H и исключения после begin_backward.
+- Cross-stream test создаёт forward **и backward внутри одного producer
+  context**; он упражняет side-stream pool и внешний wait, но не stress
+  независимых graph readers с одновременно занятыми staging slots.
+- При исключении между begin и release нет finally, возвращающего lease
+  (`mlp.py:420-443`): cleanup зависит от context/ticket destruction. Пока
+  caller держит failed graph, slot остаётся leased/in_use; следующий graph
+  может расширить pool. Это не установленная утечка нормальных шагов, но
+  полезный тест восстановления после ошибки/освобождения графа отсутствует.
+- **Минимальное дополнение:** adversarial маленькие GPU тесты указанных
+  переходов с проверкой equality/store, event completion, live leases и
+  количества allocations после gc. Для нового unpad отдельно sweep `[1,T,H]`
+  с разными T, partial+offload и реальным bnb/fp16 AMP; текущий length test
+  использует `[4,S,H]` и только один слой.
+- **Влияние:** новая async ветка пока не имеет воспроизводимого GPU acceptance
+  в этом ревью; source proof не заменяет проверку allocator scheduling.
+
+### P2-030-3 — резервирование не уменьшается при малом T / partial recompute
+
+- **Файл:строка:** `solution/mlp.py:100-117`, `:256-275`, `:279-299`.
+- Lazy first use берёт capacity=max(rows,2048) и host count из полного
+  config.num_hidden_layers. Даже если unpad даёт намного меньше T или
+  offload применяется только к нескольким слоям после partial recompute,
+  reservation остаётся полной: два host fp16 tensors на каждый из count
+  slots, upload pair и два staging pairs на capacity строк.
+- Для I=8960, capacity=2048, count=28 это **расчёт**, не измерение:
+  1960 MiB pinned CPU и 210 MiB CUDA staging. Объём фактических transfer
+  использует текущие rows, но размер постоянно живущих buffers не сокращается.
+  После opt-in pool глобально кэшируется; выключение флага внутри того же
+  процесса не освобождает уже выделенную reservation. Default никогда не
+  включает offload и сам по себе таких allocations не делает.
+- При очень малом T фиксированное staging может перекрыть экономию store;
+  full+partial recompute могут оставлять большую часть host slots пустыми.
+  Рост при большем N/retained graphs остаётся в high-water capacity.
+- **Минимальное улучшение:** optional preparation с явным корректным bound
+  и числом реально offloaded layers либо задокументированный memory budget;
+  auto-grow со временем жизни старого pool уже предусмотрен. Не уменьшать
+  capacity так, чтобы ломать допустимые большие T или retained graph.
+- **Влияние:** pinned RAM budget, init cost и низкотокенные memory peaks;
+  реальная выгодность требует T4 измерений, не меняет numerical result.
+
+### 1. Event order и lifetime: штатная последовательная ветка
+
+| Ресурс / переход | Защита в 796bf0e | Вывод |
+| --- | --- | --- |
+| gate/up → upload | `store:139-146`: copy на текущем compute stream, затем produced | Исходный gate/up не читается напрямую из D2H; его storage можно освободить после собственных current-stream uses. |
+| Предыдущий D2H → новая запись upload | `store:143`, `:155`: wait upload_free, event после обеих D2H copies | Следующий слой не перетирает upload раньше завершения DMA. |
+| upload → pinned host | `:147-159`: D2H ждёт produced, upload record_stream для обоих streams | Готовность данных и allocator lifetime учтены раздельно. |
+| Предыдущее H2D чтение host → новая D2H запись host | `:149-153`: wait slot.read при reuse | CPU lease можно снять до фактического completion, поскольку следующая запись ждёт чтение. D2H writes упорядочены одним stream. |
+| host → staging | `prefetch:189-199`: wait host.written, wait slot.used, record ready/read | Нет чтения незавершённого D2H или перезаписи staging до завершения прошлого compute reader. |
+| staging → SwiGLU backward | `tensors:225-230`: compute.wait ready, record_stream compute | Даже speculatively prefetched ticket ждёт собственную загрузку. |
+| Последний read staging → reuse | `:439-443`, `release_device:232-242`: used после kernel launch | SwiGLU возвращает новые dgate/dup allocations; последующий projection backward уже не читает gate/up staging. |
+
+Upload_free первоначально записывается на allocation stream (`:110-112`),
+учитывая возможные старые uses от caching allocator. Staging allocations
+создаются на H2D stream (`:113-114`), там же впервые заполняются. Persistent
+pool держит device/host storage; tickets держат pool, но pool/previous/owner
+ссылаются на ticket слабо и не удерживают autograd graph глобально.
+`record_stream` не принимается за защиту от логической перезаписи: её дают
+именно ready/used/read/upload_free waits в таблице.
+
+Если два staging заняты speculative prefetch, required ticket может вытеснить
+только `not in_use` slot (`:170-176`); старый ticket теряет device_slot,
+но сохраняет host data и может загрузиться снова. Предыдущая speculative
+H2D copy и новая copy сериализованы общим H2D stream. In-use slot не вытесняется;
+для дополнительных независимых simultaneous readers выделяется ещё slot.
+
+### 2. Порядок backward, retain и освобождение
+
+`previous` связывает **offloaded** calls в прямом forward порядке слабой
+ссылкой (`:134-138`, `:209`). Стандартный обратный проход по цепочке слоёв
+сначала требует последний ticket, затем prefetch его predecessor (`:221-223`),
+что совпадает с depth-first reverse layer order. Recomputed layers отсутствуют
+в цепочке и не требуют загрузки. last между шагами указывает на closed/dead
+previous, который отбрасывается, если обычный backward был завершён.
+
+Нестандартный последовательный порядок не использует predecessor как источник
+математических данных: каждый ctx вызывает required prefetch **своего** host
+slot. Предсказание может зря загрузить другой ticket, но корректность данных
+от него не зависит. Closed previous пропускается, speculatively prefetched
+данные можно вытеснить безопасно. Полезность prefetch для ветвлений не доказана.
+
+`_get_current_graph_task_keep_graph` запрашивается **до** nested autograd.grad
+(`:415-424`), поэтому локальное retain_graph=True не подменяет флаг внешнего
+GraphTask. Serial retained backward освобождает staging, но оставляет host
+lease; финальный backward без retain вызывает close. Replays без сохранённого
+графа должны завершаться явной ошибкой (`:215-216`), не читать reused host.
+Старый torch без private query консервативно ждёт context destruction.
+Если retained graph удалён без повторного backward, `__del__:251-253` закрывает
+lease; pending read/write защищаются events при следующем reuse.
+
+### 3. Pool capacity, variable T и default/partial precision
+
+Pool key — `(x.device, intermediate_width)`, current rows — numel(x)/H.
+Ticket сохраняет **свою** shape и rows (`:203-209`); store/prefetch копируют
+`[:rows]`, tensors возвращает view исходной shape. Поэтому `[B,S,H]` и
+unpad `[1,T,H]` совместимы без сохранения прошлого T или паддингового хвоста.
+Последовательные шаги с T<=capacity и своевременно closed tickets переиспользуют
+host slots. Непустые более старые shapes не участвуют в новом view.
+
+При росте capacity создаётся новый pool, старый попадает в retired list;
+cleanup требует отсутствия leased host slots и завершения host write/read и
+staging used events (`:262-273`). Tickets дополнительно держат свой старый
+pool. Очистка retired list происходит при следующем `_pool_for`, не фоново;
+нет обещания мгновенного возврата pinned RAM после последнего enlarged шага.
+Retained/concurrent graphs могут расширять host count, independent readers —
+staging count; это не фиксированный upper bound для произвольного autograd.
+
+При unset новых env flags recompute=False/offload=False: сохранение gate/up
+в fp16, projection edges и backward store совпадают с родителем коммита.
+`SOUP_MLP_OFFLOAD` включается только точным `1`, partial count по умолчанию 0;
+полный `SOUP_MLP_RECOMPUTE=1` имеет приоритет, recomputed layer не offload.
+Grad-disabled/input-without-grad путь не создаёт ticket и не меняется.
+
+Partial выбирает первые k по forward depth (`:302-322`), k проверяется
+от 0 до config.num_hidden_layers. Explicit prepare назначает индексы при
+обходе modules; lazy режим полагается на общий config и обычный порядок
+первого Qwen forward. Для нестандартного вызова отдельных слоёв это будет
+порядок первого использования, а не доказанный structural layer index;
+для такого сценария нужен prepare. Weak order map не хранит modules сильно.
+
+Recompute сохраняет input fp16 и исходный input dtype/AMP state (`:383-389`),
+при backward восстанавливает input dtype и ровно captured autocast (`:427-432`).
+Gate/up проекции frozen и гарантируют half compute eligibility; исходные
+bnb fp32 outputs представляют half values, поэтому offload half copy не
+добавляет округления сверх существующего store. Возврат dgate/dup сохраняет
+исходный projection-output dtype; projection backward выполняется вне AMP,
+dX приводится к исходному dtype. Никаких новых RNG calls нет.
+Partial смесь использует тот же full recompute механизм по выбранным слоям,
+не новую формулу производной. Численная эквивалентность и реальные bnb
+quantization/allocator взаимодействия всё равно требуют GPU тестов.
+
+### Предложенный acceptance T4 (не запускался)
+
+1. `python -m pytest solution/tests/test_mlp.py -q -rs` на pinned torch/bnb;
+   обратить внимание на bits, retained backward, pointers и memory assertions.
+2. Добавить P2-030-2 stress cases с variable `[1,T,H]`, final graph deletion,
+   capacity growth, independent graphs/out-of-order branches и ясным отказом
+   overlapping same-ticket replay (либо корректной reader accounting).
+3. Измерить no-env default отдельно от partial k/offload; проверить pinned CPU
+   high-water, CUDA peak, PCIe transfers и event stalls без переноса cache.
+4. Совместный unpad+offload+partial paired harness/checks с прежними trainer
+   settings и отсутствием параллельной GPU-работы. Ни ce1ff09 результаты,
+   ни локальная syntax compilation этот opt-in режим не валидируют.
