@@ -812,7 +812,7 @@ def _run_joint_acceptance(backend):
     os.environ.pop("SOUP_FUSED_DISABLE", None)
     os.environ["SOUP_FUSED_NORM_FP16"] = "1"
     os.environ.pop("SOUP_MLP_RECOMPUTE", None)
-    os.environ.pop("SOUP_MLP_OFFLOAD", None)
+    os.environ["SOUP_MLP_OFFLOAD"] = "0"
     os.environ.pop("SOUP_MLP_RECOMPUTE_LAYERS", None)
     solution.apply()
     solution.apply()

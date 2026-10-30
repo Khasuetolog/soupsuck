@@ -21,7 +21,8 @@ backward uses bnb's own dequantization policy; we do not dequantize weights or
 replace bnb's derivative. recompute rebuilds gate/up graphs under the captured
 forward autocast, adding exactly two projection forwards per layer.
 
-SOUP_MLP_OFFLOAD=1 transfers compressed gate/up to persistent pinned CPU
+Offload is enabled by default; only SOUP_MLP_OFFLOAD=0 disables it. It
+transfers compressed gate/up to persistent pinned CPU
 slots. One reusable CUDA upload pair bounds in-flight D2H storage; two CUDA
 download pairs prefetch the current/next backward layer. Events protect every
 overwrite; record_stream protects cross-stream allocator lifetime. No host
@@ -38,7 +39,10 @@ At the task's maximum N and without partial recompute, offload reserves
 1960 MiB CUDA saved activations.
 Each step transfers 3920 MiB over PCIe, plus an upload copy/cast on the GPU.
 Overlap is best-effort: if PCIe falls behind, a GPU event wait bounds memory
-but may slow forward. There is no promise of zero slowdown without T4 timing.
+but may slow forward. The default follows the full T4 run 39b5050 with
+SOUP_MLP_OFFLOAD=1: all 10 checks passed, speedup 1.238x and memory ratio
+3.810x versus Soup, peak 3765 MiB, eval loss +0.001%. The no-offload run
+e0c50a2 had peak 4795 MiB.
 prepare_mlp_offload(model,max_rows=2048) can reserve all buffers before
 training; lazy first use rounds actual N to a power of two and reserves only
 non-recomputed layers. Reservations keep their high-water mark. Only a
@@ -50,8 +54,8 @@ All Qwen MLP projection shapes are equal, so any k save the same bytes and
 add the same GEMM work; this deterministic choice makes no unmeasured claim
 that one layer is cheaper. Explicit preparation assigns depth indices; normal
 Qwen forward assigns them lazily using its shared config. Full recompute
-overrides partial selection; recomputed layers do not offload. Both new
-switches default off, preserving store behavior.
+overrides partial selection; recomputed layers do not offload. Recompute
+switches default off; explicit SOUP_MLP_OFFLOAD=0 selects store instead.
 
 No RNG operation is added; LoRA wrappers, trainable weights, custom projections
 or hooks, and unsupported precision use the original forward. Higher-order
@@ -493,7 +497,7 @@ def fused_qwen2_mlp(mlp, x, recompute=None, offload=None):
     if recompute is None:
         recompute = os.environ.get("SOUP_MLP_RECOMPUTE") == "1" or _partial_recompute(mlp)
     if offload is None:
-        offload = os.environ.get("SOUP_MLP_OFFLOAD") == "1"
+        offload = os.environ.get("SOUP_MLP_OFFLOAD") != "0"
     offload = bool(offload) and not recompute
     if not torch.is_grad_enabled() or not x.requires_grad:
         from .kernels.swiglu_fused import swiglu_fused_forward

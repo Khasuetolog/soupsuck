@@ -14,7 +14,8 @@ TOLERANCE = dict(rtol=2e-3, atol=2e-3)
 
 @pytest.fixture(autouse=True)
 def explicit_mode_environment(monkeypatch):
-    for key in ("SOUP_MLP_OFFLOAD", "SOUP_MLP_RECOMPUTE", "SOUP_MLP_RECOMPUTE_LAYERS"):
+    monkeypatch.setenv("SOUP_MLP_OFFLOAD", "0")  # store cases are explicit, independent of production default
+    for key in ("SOUP_MLP_RECOMPUTE", "SOUP_MLP_RECOMPUTE_LAYERS"):
         monkeypatch.delenv(key, raising=False)
 
 
@@ -356,7 +357,7 @@ def test_offload_prefetch_and_multilayer_peak(offload_runtime):
     assert len(pool.staging) == 2
 
 
-def test_offload_environment_opt_in_preserves_default_store(offload_runtime, monkeypatch):
+def test_offload_explicit_store_and_recompute_priority(offload_runtime, monkeypatch):
     runtime = offload_runtime
     layer = FrozenMLP(intermediate=256)
     x = torch.randn((2, 5, 64), device="cuda", dtype=torch.float16, requires_grad=True)
@@ -371,6 +372,18 @@ def test_offload_environment_opt_in_preserves_default_store(offload_runtime, mon
     x.grad = None
     runtime.fused_qwen2_mlp(layer, x).sum().backward()
     assert runtime._OFFLOAD_POOLS
+
+
+@pytest.mark.parametrize("setting", [None, "0", "1", "other"])
+def test_offload_default_and_literal_zero_opt_out(offload_runtime, monkeypatch, setting):
+    if setting is None:
+        monkeypatch.delenv("SOUP_MLP_OFFLOAD", raising=False)
+    else:
+        monkeypatch.setenv("SOUP_MLP_OFFLOAD", setting)
+    layer = FrozenMLP(intermediate=256)
+    x = torch.randn((2, 5, 64), device="cuda", dtype=torch.float16, requires_grad=True)
+    offload_runtime.fused_qwen2_mlp(layer, x).sum().backward()
+    assert bool(offload_runtime._OFFLOAD_POOLS) == (setting != "0")
 
 
 def test_offload_cross_stream_producer_and_consumer(offload_runtime):
