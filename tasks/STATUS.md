@@ -27,3 +27,4 @@
 | solution MLP recompute | 8f8ebbc | — | 86.39 s / 4143 MiB / 2.04966, loop 53.63 s | |
 | full ×1 `SOUP_MLP_RECOMPUTE=1` | ce1ff09 | 97.75 s / 14345 MiB / 2.04964 | 93.95 s / 4123 MiB / 2.04968 | 10/10 PASS; speedup **1.040 (<1.05 = 0 баллов скорости)**, memory 3.479, share 10.6% → дефолт остаётся store |
 | **full ×1** | **585de28** | 87.56 s / 14345 MiB / 2.04965 | **71.30 s / 5403 MiB / 2.04971** | **10/10 PASS**; speedup 1.228, memory 2.655, share 14.8%; **pytest solution 247 passed / 0 failed**; Soup 79 passed |
+| **full ×1 (unpad + packed head)** | **42423bf** | 78.32 s / 14345 MiB / 2.04968 | **63.88 s / 4775 MiB / 2.04967** | **10/10 PASS**; speedup 1.226, memory 3.004, share 16.6%; pytest solution 300 passed / 1 failed (test_unpad, разбирается S-032) |
