@@ -297,6 +297,118 @@ def _statistics(torch, output, raw, labels):
         return losses, entropy, correct, valid.sum()
 
 
+def _gradient_report(torch, actual, expected, *, rtol, atol):
+    """CPU/fp64 diagnostics; the acceptance budget is unchanged."""
+    actual, expected = actual.detach().cpu().double(), expected.detach().cpu().double()
+    error = (actual - expected).abs()
+    budget = atol + rtol * expected.abs()
+    flat = int(error.reshape(-1).argmax())
+    coordinates = []
+    for size in reversed(error.shape):
+        coordinates.append(flat % size)
+        flat //= size
+    position = tuple(reversed(coordinates))
+    # Relative error at a zero reference is infinite, rather than hidden by
+    # an arbitrary denominator floor. The mixed budget remains authoritative.
+    relative = torch.where(expected != 0, error / expected.abs(),
+                           torch.where(error == 0, 0.0, float("inf")))
+    return (f"max_abs={error.max().item():.9g} at={position} "
+            f"actual={actual[position].item():.9g} reference={expected[position].item():.9g} "
+            f"max_rel={relative.max().item():.9g} "
+            f"actual_norm={actual.norm().item():.9g} reference_norm={expected.norm().item():.9g} "
+            f"diff_norm={error.norm().item():.9g} "
+            f"outside_budget={(error > budget).sum().item()}/{error.numel()}")
+
+
+def _capture_lora_operands(torch, wrapped, monkeypatch):
+    """Observe native Linear operands without module hooks (which reject unpad).
+
+    AMP Linear consumes inputs rounded to its output dtype. Its weight gradient
+    has the independent local ideal dW = dY.T @ X, evaluated here on CPU/fp64.
+    This diagnoses GEMM rounding separately from differences in X or upstream
+    dY. A local ideal is NOT an end-to-end fp64 oracle and cannot by itself
+    justify accepting different upstream gradients.
+    """
+    names = {id(p): name for name, p in wrapped.named_parameters() if "lora_" in name}
+    phases = {"padded": {}, "packed": {}}
+    current = ["padded"]
+    linear = torch.nn.functional.linear
+
+    def observed(input, weight, bias=None):
+        output = linear(input, weight, bias)
+        name = names.get(id(weight))
+        if name is not None:
+            assert name not in phases[current[0]], f"unexpected repeated LoRA Linear: {name}"
+            record = {"x": input.detach().to(output.dtype).cpu().double()}
+            phases[current[0]][name] = record
+
+            def save_gradient(gradient):
+                record["dy"] = gradient.detach().cpu().double()
+
+            output.register_hook(save_gradient)
+        return output
+
+    monkeypatch.setattr(torch.nn.functional, "linear", observed)
+    return current, phases
+
+
+def _lora_oracle_report(torch, phases, name, actual, expected, mask, *, rtol, atol):
+    reference, packed = phases["padded"][name], phases["packed"][name]
+    mask = mask.detach().cpu().bool().reshape(-1)
+    report = []
+    ideals = {}
+    for phase, record, grad in (("padded", reference, expected), ("packed", packed, actual)):
+        x = record["x"].reshape(-1, record["x"].shape[-1])
+        dy = record["dy"].reshape(-1, record["dy"].shape[-1])
+        ideal = dy.T @ x
+        ideals[phase] = ideal
+        report.append(f"{phase} dW versus local fp64 ideal: "
+                      + _gradient_report(torch, grad, ideal, rtol=rtol, atol=atol))
+        if phase == "padded":
+            report.append(f"padded dY on pads norm={dy[~mask].norm().item():.9g}")
+    # Both formats include all real tokens, including the last labelled-ignored
+    # token. Never compare padded rows to positions from a different sequence.
+    for operand in ("x", "dy"):
+        padded_value = reference[operand].reshape(-1, reference[operand].shape[-1])[mask]
+        packed_value = packed[operand].reshape(-1, packed[operand].shape[-1])
+        report.append(f"real {operand} packed versus padded (exact budget): "
+                      + _gradient_report(torch, packed_value, padded_value, rtol=0, atol=0))
+    report.append("local fp64 ideals packed versus padded: "
+                  + _gradient_report(torch, ideals["packed"], ideals["padded"], rtol=rtol, atol=atol))
+    return "\n".join(report)
+
+
+def test_lora_operand_oracle_uses_native_amp_rounding_without_module_hooks(monkeypatch):
+    torch = pytest.importorskip("torch")
+    model = torch.nn.Module()
+    model.lora_A = torch.nn.Linear(3, 2, bias=False)
+    phase, operands = _capture_lora_operands(torch, model, monkeypatch)
+    x = torch.tensor([[1.25, -0.75, 0.5], [0.25, 1.5, -1.0]])
+    dy = torch.tensor([[0.5, -0.25], [1.25, 0.75]])
+    for label in ("padded", "packed"):
+        phase[0] = label
+        model.zero_grad(set_to_none=True)
+        model.lora_A(x).backward(dy)
+        record = operands[label]["lora_A.weight"]
+        torch.testing.assert_close(model.lora_A.weight.grad.double(), record["dy"].T @ record["x"],
+                                   rtol=0, atol=0)
+    assert not model.lora_A._forward_hooks and not model.lora_A._backward_hooks
+    report = _lora_oracle_report(torch, operands, "lora_A.weight", model.lora_A.weight.grad,
+                                 model.lora_A.weight.grad, torch.ones(2), rtol=0, atol=0)
+    assert "padded dY on pads norm=0" in report
+    assert "outside_budget=0/6" in report
+
+
+def test_gradient_report_exposes_position_and_zero_reference():
+    torch = pytest.importorskip("torch")
+    actual = torch.tensor([[1.0, 3.0], [0.25, 4.0]])
+    expected = torch.tensor([[1.0, 2.0], [0.0, 4.0]])
+    report = _gradient_report(torch, actual, expected, rtol=0.03, atol=0.001)
+    assert "max_abs=1 at=(0, 1) actual=3 reference=2" in report
+    assert "max_rel=inf" in report
+    assert "outside_budget=2/4" in report
+
+
 @pytest.mark.parametrize("backend", ["dense", "bnb"])
 @pytest.mark.parametrize("lengths,sequence", [
     ((7, 4, 1, 6), 7), ((7,), 7), ((7, 7, 7, 7), 7), ((5, 5, 5, 5), 9),
@@ -304,6 +416,7 @@ def _statistics(torch, output, raw, labels):
 def test_padded_equivalence_loss_statistics_lora_gradients_rng(runtime, monkeypatch, backend, lengths, sequence):
     torch, module, device = runtime
     wrapped, raw = _model(torch, module, device, backend)
+    phase, operands = _capture_lora_operands(torch, wrapped, monkeypatch)
     ids, labels, mask = _batch(torch, device, lengths, sequence)
     initial = _rng(torch, device)
     captures, plans = [], []
@@ -350,6 +463,7 @@ def test_padded_equivalence_loss_statistics_lora_gradients_rng(runtime, monkeypa
     wrapped.zero_grad(set_to_none=True)
     _set_rng(torch, device, initial)
     monkeypatch.setenv("SOUP_UNPAD", "1")
+    phase[0] = "packed"
     with _amp(torch, device):
         actual = wrapped(input_ids=ids, labels=labels, attention_mask=mask, use_cache=False)
     actual_stats = _statistics(torch, actual, raw, labels)
@@ -378,15 +492,24 @@ def test_padded_equivalence_loss_statistics_lora_gradients_rng(runtime, monkeypa
     torch.testing.assert_close(losses.sum(-1) / counts.clamp_min(1),
                                expected_losses.sum(-1) / counts.clamp_min(1), **tolerance)
     actual.loss.mul(128).backward()
+    gradient_failures = []
     for name, p in wrapped.named_parameters():
         if name in reference_grads:
             ref = reference_grads[name]
             assert p.grad is not None and torch.isfinite(p.grad).all()
-            torch.testing.assert_close(p.grad, ref, rtol=3e-2 if device == "cuda" else 2e-4,
-                                       atol=1e-3 if device == "cuda" else 2e-6, msg=name)
-            assert (p.grad - ref).norm() <= (0.03 if device == "cuda" else 2e-4) * ref.norm() + 2e-6
+            rtol, atol = (3e-2, 1e-3) if device == "cuda" else (2e-4, 2e-6)
+            try:
+                torch.testing.assert_close(p.grad, ref, rtol=rtol, atol=atol)
+                assert (p.grad - ref).norm() <= rtol * ref.norm() + 2e-6
+            except AssertionError as error:
+                gradient_failures.append(
+                    f"{name}\n{error}\n"
+                    + _gradient_report(torch, p.grad, ref, rtol=rtol, atol=atol) + "\n"
+                    + _lora_oracle_report(torch, operands, name, p.grad, ref, mask,
+                                          rtol=rtol, atol=atol))
     assert unpad._ACTIVE.get() is None and unpad._LABELS.get() is None
     assert unpad._HEAD_CAPTURE.get() is None
+    assert not gradient_failures, "\n\n".join(gradient_failures)
 
 
 @pytest.mark.parametrize("reason", ["eval", "cache", "left", "no_mask", "hidden", "pad_label"])
