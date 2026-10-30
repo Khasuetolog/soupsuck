@@ -4,7 +4,9 @@ Register patch_qwen2_unpad(module) after the existing Qwen2 callbacks in
 solution.patch. No trainer/config/data changes or lora.py edits are needed.
 The original Qwen2Model loop runs on [1,T,H]; only attention is segmented.
 Its output is scattered to [B,S,H], so existing head/TRL/Rewind code keeps its
-original labels, shift, denominator and masks. Padded hidden states are zero;
+original labels, shift, denominator and masks. An explicitly scoped fused-head
+request also receives the original packed hidden, avoiding vocabulary work on
+padding without a second gather of hidden. Padded hidden states are zero;
 their labels must be ignored. Observable hidden-state/attention requests fall
 back. Eval, caches, non-SDPA, attention dropout, sliding/dynamic RoPE, left
 padding and unknown adapter paths also fall back before any random operation.
@@ -34,6 +36,7 @@ from .utils import enabled
 _MARKER = "_solution_unpad_original"
 _ACTIVE = ContextVar("solution_unpad_batch", default=None)
 _LABELS = ContextVar("solution_unpad_labels", default=None)
+_HEAD_CAPTURE = ContextVar("solution_unpad_head_capture", default=None)
 _QWEN = "transformers.models.qwen2.modeling_qwen2"
 
 
@@ -79,6 +82,55 @@ class PackedBatch:
     @property
     def tokens(self):
         return sum(self.lengths)
+
+
+@dataclass(frozen=True)
+class PackedHead:
+    """One decoder call's differentiable packed hidden and its padded layout."""
+    hidden: object
+    batch: PackedBatch
+    labels: object
+    padded_hidden: object
+
+    def matches(self, hidden, labels):
+        batch = self.batch
+        return (hidden is self.padded_hidden and labels is self.labels
+                and hidden.shape == (batch.batch, batch.sequence, batch.hidden)
+                and labels.shape == (batch.batch, batch.sequence)
+                and self.hidden.shape == (1, batch.tokens, batch.hidden)
+                and self.hidden.dtype == hidden.dtype
+                and self.hidden.device == hidden.device == labels.device
+                and batch.indices.device == hidden.device)
+
+
+@dataclass
+class CapturedHead:
+    model: object
+    labels: object
+    payload: object = None
+
+    def take(self, hidden, labels):
+        """Consume once; identity checks prevent stale/nested-call statistics."""
+        payload, self.payload = self.payload, None
+        return payload if payload is not None and payload.matches(hidden, labels) else None
+
+
+@contextmanager
+def capture_packed_head(model, labels):
+    """Scope one eligible head's decoder call; no process/model tensor cache."""
+    request = CapturedHead(model, labels)
+    token = _HEAD_CAPTURE.set(request)
+    try:
+        yield request
+    finally:
+        _HEAD_CAPTURE.reset(token)
+
+
+def _publish_packed_head(model, hidden, batch, padded_hidden):
+    request, labels_call = _HEAD_CAPTURE.get(), _LABELS.get()
+    if (request is not None and request.model is model and labels_call is not None
+            and labels_call[0] is request.labels):
+        request.payload = PackedHead(hidden, batch, request.labels, padded_hidden)
 
 
 @contextmanager
@@ -334,7 +386,9 @@ def _patch_model(module):
                 # mask across row boundaries; segmented attention owns masks.
                 attention_mask={"full_attention": None}, position_ids=packed_positions,
                 past_key_values=None, use_cache=False, **kwargs)
-        return BaseModelOutputWithPast(last_hidden_state=_scatter(output.last_hidden_state, batch),
+        padded_hidden = _scatter(output.last_hidden_state, batch)
+        _publish_packed_head(self, output.last_hidden_state, batch, padded_hidden)
+        return BaseModelOutputWithPast(last_hidden_state=padded_hidden,
                                        past_key_values=output.past_key_values)
 
     setattr(forward, _MARKER, original)

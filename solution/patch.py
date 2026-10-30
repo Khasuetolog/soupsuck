@@ -171,6 +171,7 @@ def _patch_head(cls):
         import torch
         from transformers.modeling_outputs import CausalLMOutputWithPast
         from .autograd import fused_head
+        from .unpad import capture_packed_head
 
         setattr(self, _MODEL_STEP, None)
         arguments = dict(input_ids=input_ids, attention_mask=attention_mask,
@@ -189,9 +190,10 @@ def _patch_head(cls):
             with _half_norm_scope(norm):
                 return original(self, labels=labels, logits_to_keep=logits_to_keep, **arguments)
         norm = self.model.norm if _final_norm_half_ready(self, kwargs) else None
-        with _half_norm_scope(norm):
+        with capture_packed_head(self.model, labels) as captured, _half_norm_scope(norm):
             outputs = self.model(**arguments)
         hidden = outputs.last_hidden_state
+        packed_head = captured.take(hidden, labels)
         # Unsupported decoder layouts still use its already-computed result.
         reason = tensor_ineligibility(hidden, "hidden")
         if reason is None:
@@ -210,7 +212,7 @@ def _patch_head(cls):
                                       vocab_size=self.config.vocab_size, **kwargs)
         else:
             loss, step = fused_head(hidden, self.lm_head.weight, labels,
-                                    kwargs.get("num_items_in_batch"))
+                                    kwargs.get("num_items_in_batch"), packed_head=packed_head)
             setattr(self, _MODEL_STEP, step)
             logits = None
             _report_head()

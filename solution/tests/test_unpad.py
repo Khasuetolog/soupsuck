@@ -42,6 +42,34 @@ def test_batch_scope_restores_after_nested_exception():
     assert unpad._ACTIVE.get() is None
 
 
+def test_packed_head_capture_is_owned_consumed_once_and_exception_safe():
+    owner, foreign, labels = object(), object(), SimpleNamespace(shape=(2, 3), device="cpu")
+    batch = unpad.PackedBatch(2, 3, 4, (3, 1), SimpleNamespace(device="cpu"), frozenset(), frozenset())
+    packed = SimpleNamespace(shape=(1, 4, 4), dtype="fp16", device="cpu")
+    padded = SimpleNamespace(shape=(2, 3, 4), dtype="fp16", device="cpu")
+    token = unpad._LABELS.set((labels, object()))
+    try:
+        with unpad.capture_packed_head(owner, labels) as captured:
+            unpad._publish_packed_head(foreign, packed, batch, padded)
+            assert captured.payload is None
+            with pytest.raises(ValueError), unpad.capture_packed_head(foreign, labels):
+                raise ValueError("restore nested head scope")
+            assert unpad._HEAD_CAPTURE.get() is captured
+            unpad._publish_packed_head(owner, packed, batch, padded)
+        assert unpad._HEAD_CAPTURE.get() is None
+        assert captured.take(padded, labels).hidden is packed
+        assert captured.take(padded, labels) is None
+        with unpad.capture_packed_head(owner, labels) as stale:
+            unpad._publish_packed_head(owner, packed, batch, padded)
+        assert stale.take(object(), labels) is None
+        assert stale.take(padded, labels) is None
+        with unpad.capture_packed_head(owner, labels) as wrong_labels:
+            unpad._publish_packed_head(owner, packed, batch, padded)
+        assert wrong_labels.take(padded, object()) is None
+    finally:
+        unpad._LABELS.reset(token)
+
+
 def test_fake_module_registration_is_a_noop():
     assert not unpad.patch_qwen2_unpad(ModuleType(unpad._QWEN))
     assert not unpad.patch_qwen2_unpad(object())
@@ -130,6 +158,11 @@ def test_plan_preserves_row_order_and_rejects_supervised_padding(monkeypatch):
 def runtime(monkeypatch):
     torch = pytest.importorskip("torch")
     pytest.importorskip("transformers")
+    import solution
+
+    # Install the fused head before the outer unpad labels wrapper, matching
+    # the real post-import callback order (also works when already installed).
+    solution.apply()
     from transformers.models.qwen2 import modeling_qwen2 as module
 
     for cls in (module.Qwen2ForCausalLM, module.Qwen2Model, module.Qwen2Attention):
@@ -245,6 +278,15 @@ def test_padded_equivalence_loss_statistics_lora_gradients_rng(runtime, monkeypa
     captures, plans = [], []
     dropout = torch.nn.functional.dropout
     plan = unpad._plan
+    head_rows = []
+    if device == "cuda":
+        from solution.kernels import cross_entropy as ce
+
+        head = ce.fused_linear_cross_entropy
+        def observed_head(hidden, weight, targets, ignore_index=-100):
+            head_rows.append(hidden.shape[0])
+            return head(hidden, weight, targets, ignore_index=ignore_index)
+        monkeypatch.setattr(ce, "fused_linear_cross_entropy", observed_head)
 
     def observed_dropout(input, p=0.5, training=True, inplace=False):
         output = dropout(input, p=p, training=training, inplace=inplace)
@@ -288,6 +330,8 @@ def test_padded_equivalence_loss_statistics_lora_gradients_rng(runtime, monkeypa
     assert (plans[-1] is not None) == expect_packed
     if expect_packed:
         assert plans[-1].tokens == sum(lengths)
+    if device == "cuda":
+        assert head_rows == [len(lengths) * sequence, sum(lengths)]
     tolerance = dict(rtol=3e-3, atol=3e-3) if device == "cuda" else dict(rtol=2e-5, atol=2e-6)
     torch.testing.assert_close(actual.loss, reference_loss, **tolerance)
     losses, entropy, correct, count = actual_stats
@@ -311,6 +355,7 @@ def test_padded_equivalence_loss_statistics_lora_gradients_rng(runtime, monkeypa
                                        atol=1e-3 if device == "cuda" else 2e-6, msg=name)
             assert (p.grad - ref).norm() <= (0.03 if device == "cuda" else 2e-4) * ref.norm() + 2e-6
     assert unpad._ACTIVE.get() is None and unpad._LABELS.get() is None
+    assert unpad._HEAD_CAPTURE.get() is None
 
 
 @pytest.mark.parametrize("reason", ["eval", "cache", "left", "no_mask", "hidden", "pad_label"])
@@ -365,3 +410,71 @@ def test_instance_dropout_only_and_exact_padded_rng(runtime):
         actual = selected(unpad._pack(x, layout))
     torch.testing.assert_close(actual, unpad._pack(expected, layout), rtol=0, atol=0)
     assert torch.equal(_rng(torch, device), expected_rng)
+
+
+@pytest.mark.parametrize("denominator", [None, 17, "tensor"])
+@pytest.mark.parametrize("all_ignored", [False, True])
+def test_packed_fused_head_targets_metrics_and_gradients(monkeypatch, denominator, all_ignored):
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("fused CE requires CUDA")
+    pytest.importorskip("triton")
+    pytest.importorskip("soup_cli")
+    from solution.autograd import fused_head
+    from solution.kernels import cross_entropy as ce
+
+    torch.manual_seed(27027)
+    lengths, sequence, width = (7, 3, 1), 7, 32
+    _, labels, mask = _batch(torch, "cuda", lengths, sequence)
+    # Nonignored FIRST labels expose a mistaken shift across packed row
+    # boundaries: none is a target of the preceding row's last real token.
+    labels[:, 0] = 5
+    if all_ignored:
+        labels.fill_(-100)
+    indices = torch.tensor([row * sequence + col for row, length in enumerate(lengths)
+                            for col in range(length)], device="cuda")
+    layout = unpad.PackedBatch(3, sequence, width, lengths, indices, frozenset(), frozenset())
+    full = torch.randn(3, sequence, width, device="cuda").masked_fill(~mask.bool().unsqueeze(-1), 0)
+    reference = full.detach().clone().requires_grad_()
+    packed = unpad._pack(full, layout).detach().requires_grad_()
+    padded = unpad._scatter(packed, layout)
+    payload = unpad.PackedHead(packed, layout, labels, padded)
+    weight = torch.randn(127, width, device="cuda") / width**0.5
+    divisor = torch.tensor(17, device="cuda") if denominator == "tensor" else denominator
+    rows, seen_targets = [], []
+    native = ce.fused_linear_cross_entropy
+    def observed(hidden, weight, targets, ignore_index=-100):
+        rows.append(hidden.shape[0])
+        seen_targets.append(targets.detach().clone())
+        return native(hidden, weight, targets, ignore_index=ignore_index)
+    monkeypatch.setattr(ce, "fused_linear_cross_entropy", observed)
+    expected_loss, expected = fused_head(reference, weight, labels, divisor)
+    actual_loss, actual = fused_head(padded, weight, labels, divisor, packed_head=payload)
+    assert rows == [3 * sequence, sum(lengths)]
+    shifted = torch.nn.functional.pad(labels, (0, 1), value=-100)[..., 1:]
+    assert torch.equal(seen_targets[-1], shifted.reshape(-1).index_select(0, indices))
+    last = 0
+    for length in lengths:
+        last += length
+        assert seen_targets[-1][last - 1] == -100
+    tolerance = dict(rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(actual_loss, expected_loss, equal_nan=True, **tolerance)
+    torch.testing.assert_close(actual.token_loss, expected.token_loss, **tolerance)
+    torch.testing.assert_close(actual.token_entropy[mask.bool()],
+                               expected.token_entropy[mask.bool()], **tolerance)
+    assert torch.count_nonzero(actual.token_entropy[~mask.bool()]) == 0
+    assert torch.count_nonzero(actual.token_loss[~mask.bool()]) == 0
+    torch.testing.assert_close((actual.token_entropy * mask).sum() / mask.sum(),
+                               (expected.token_entropy * mask).sum() / mask.sum(), **tolerance)
+    assert actual.correct == expected.correct and actual.labelled == expected.labelled
+    expected_loss.mul(128).backward()
+    actual_loss.mul(128).backward()
+    assert torch.isfinite(packed.grad).all()
+    torch.testing.assert_close(packed.grad, unpad._pack(reference.grad, layout), rtol=1e-2, atol=2e-3)
+    assert torch.count_nonzero(reference.grad[~mask.bool()]) == 0
+    # Stale output identity must fall back to the complete current head.
+    other = padded.detach().clone().requires_grad_()
+    fallback_loss, fallback = fused_head(other, weight, labels, divisor, packed_head=payload)
+    assert rows[-1] == labels.numel()
+    torch.testing.assert_close(fallback_loss, expected_loss.detach(), equal_nan=True, **tolerance)
+    torch.testing.assert_close(fallback.token_entropy, expected.token_entropy, **tolerance)
