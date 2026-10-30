@@ -26,11 +26,37 @@ validation; no bitwise end-to-end equivalence is claimed for fp16 input.
 from functools import wraps
 import math
 import numbers
+import os
 import sys
 
 from .utils import enabled, supported_tensor
 
 _MARKER = "_solution_lora_4bit_original"
+
+
+def _read_only_base_result(layer, result):
+    """EXP-004: our functional epilogue never writes PEFT's defensive clone.
+
+    Keep cloning for custom modules/hooks which might retain/mutate the base
+    output while the adapter runs. The certified unpad Dropout binding only
+    scatters its own input and does not mutate this result.
+    """
+    if os.environ.get("SOUP_EXP_LAUNCH_TRIM") != "1" or not result.is_contiguous():
+        return False
+    base = layer.base_layer
+    if (type(base).__module__ != "bitsandbytes.nn.modules" or type(base).__name__ != "Linear4bit"
+            or any(p.requires_grad for p in base.parameters())):
+        return False
+    adapter = layer.active_adapters[0]
+    for module in (base, layer.lora_A[adapter], layer.lora_B[adapter], layer.lora_dropout[adapter]):
+        if (module._forward_hooks or module._forward_pre_hooks or module._backward_hooks
+                or module._backward_pre_hooks):
+            return False
+        if "forward" in module.__dict__ and not (
+                type(module).__name__ == "Dropout"
+                and hasattr(module.forward, "_solution_unpad_original")):
+            return False
+    return True
 
 
 def _eligible(layer, x, kwargs, *, _input_dtype=None):
@@ -113,7 +139,9 @@ def _patch_class(cls, variant_kwarg_keys):
         kwargs.pop("adapter_names", None)
         for key in variant_kwarg_keys:
             kwargs.pop(key, None)
-        result = self.base_layer(x, *args, **kwargs).clone()
+        result = self.base_layer(x, *args, **kwargs)
+        if not _read_only_base_result(self, result):
+            result = result.clone()
         adapter = self.active_adapters[0]
         a, b = self.lora_A[adapter], self.lora_B[adapter]
         lora_input = x.float() if x.dtype == torch.float16 else x

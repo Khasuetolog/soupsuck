@@ -364,7 +364,7 @@ def _patch_attention(module):
         if batch is None or id(self) not in batch.attention_ids:
             return original(self, hidden_states, position_embeddings, attention_mask,
                             past_key_values=past_key_values, **kwargs)
-        from transformers.integrations.sdpa_attention import sdpa_attention_forward
+        from transformers.integrations.sdpa_attention import sdpa_attention_forward, repeat_kv
         import torch
 
         shape = (*hidden_states.shape[:-1], -1, self.head_dim)
@@ -373,6 +373,7 @@ def _patch_attention(module):
         value = self.v_proj(hidden_states).view(shape).transpose(1, 2)
         query, key = module.apply_rotary_pos_emb(query, key, *position_embeddings)
         rows, start = [], 0
+        trim = os.environ.get("SOUP_EXP_LAUNCH_TRIM") == "1" and query.is_cuda
         for length in batch.lengths:
             if length not in batch.causal_masks:
                 batch.causal_masks[length] = torch.ones(
@@ -381,9 +382,21 @@ def _patch_attention(module):
             # Preserve the pinned SDPA helper's masked-path GQA policy: it
             # repeats KV, rather than enable_gqa=True (math-only on some T4
             # paths). Backend enable/disable settings are never overridden.
-            output, _ = sdpa_attention_forward(
-                self, query[:, :, start:stop], key[:, :, start:stop], value[:, :, start:stop],
-                batch.causal_masks[length], dropout=0.0, scaling=self.scaling, is_causal=False)
+            q, k, v = query[:, :, start:stop], key[:, :, start:stop], value[:, :, start:stop]
+            if trim:
+                # Pinned helper's masked CUDA branch, with identical SDPA
+                # arguments. Defer its final contiguous copy until the cat
+                # that immediately copies all rows into one output anyway.
+                if self.num_key_value_groups > 1:
+                    k = repeat_kv(k, self.num_key_value_groups)
+                    v = repeat_kv(v, self.num_key_value_groups)
+                output = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, attn_mask=batch.causal_masks[length], dropout_p=0.0,
+                    scale=self.scaling, is_causal=False).transpose(1, 2)
+            else:
+                output, _ = sdpa_attention_forward(
+                    self, q, k, v, batch.causal_masks[length],
+                    dropout=0.0, scaling=self.scaling, is_causal=False)
             rows.append(output)
             start = stop
         output = torch.cat(rows, dim=1).reshape(*hidden_states.shape[:-1], -1).contiguous()
