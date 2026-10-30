@@ -225,6 +225,14 @@ def summarize(directory):
             print(json.dumps(record))
         if probe.get("error"):
             print(probe["error"])
+    for path in sorted(directory.rglob("bench_kernels.json")):
+        bench = json.loads(path.read_text())
+        print("Kernel benchmark:", path.relative_to(directory), "ok:", bench.get("ok"),
+              "device:", bench.get("device"))
+        for case, best in bench.get("best", {}).items():
+            print(case, json.dumps(best))
+        if bench.get("error"):
+            print(bench["error"])
     for path in sorted(directory.glob("**/probe_import*.log")):
         print(path.relative_to(directory), "(tail)")
         print("\n".join(path.read_text(errors="replace").splitlines()[-12:]))
@@ -285,7 +293,7 @@ def main():
     push = commands.add_parser("push-code", help="Publish committed HEAD as a private Kaggle dataset")
     push.set_defaults(handler=push_code)
     launch = commands.add_parser("run", help="Run a private T4 notebook and download its outputs")
-    launch.add_argument("--mode", choices=("unit", "solution", "full", "full2", "probe"), required=True)
+    launch.add_argument("--mode", choices=("unit", "solution", "full", "full2", "probe", "bench"), required=True)
     launch.add_argument("--dry-run", action="store_true", help="Build notebook/metadata without invoking Kaggle")
     launch.add_argument("--env", action="append", type=env_pair, default=[], metavar="SOUP_KEY=VALUE",
                         help="Experiment flag (repeatable); SOUP_APPLY_SOLUTION is reserved")
