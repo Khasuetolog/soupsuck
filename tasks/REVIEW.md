@@ -298,3 +298,221 @@ HEAD cold wall/variant-count на T4 ещё UNVERIFIED.
    используют другой MLP, а profiler run останавливается на 24 шагах и не заменяет
    измеряемый 64-step run. Дополнительный NF4 commit требует отдельного ревью
    и полного измерения, этот отчёт его не одобряет.
+
+
+## S-021 — ревью NF4 S-015 и fused CE S-018
+
+Дата: 2026-10-30. Проверены **фиксированные коммиты** `d228f99` (NF4 kernel,
+installer и tests) и `8f8ebbc` (CE и tests). Незакоммиченные decoder/rmsnorm/lora/
+patch изменения S-016 не читались для этого ревью и не одобряются им.
+Изменён только этот отчёт, без коммита и без Kaggle-запуска.
+
+**Итог:** новых доказанных P0/P1 в этих двух изменениях не найдено.
+S-017 P1-1 закрыт структурой CE backward на уровне кода; GPU-проверка новых
+тестов и paired качества/производительности остаётся UNVERIFIED. Есть три P2
+ниже. Правильность NF4 подтверждена сверкой формата и call sites, а не новым
+утверждением о побитовом GPU-результате.
+
+### Независимые источники и воспроизводимость чтения
+
+Скачан **вне репозитория**, без установки, официальный Linux wheel:
+[bitsandbytes 0.50.2, PyPI](https://pypi.org/project/bitsandbytes/0.50.2/#files),
+`bitsandbytes-0.50.2-py3-none-manylinux_2_24_x86_64.whl`.
+SHA256 файла сверен с JSON PyPI:
+`55348a9a4a21bfd99cf8c7b32fe67b4030ae5c2a05738e03c1747f65fa6ec283`.
+Извлечены только Python-исходники в `/private/tmp/s021-bnb-0.50.2/`:
+`bitsandbytes/functional.py`, `backends/cuda/ops.py`, `autograd/_functions.py`,
+`nn/modules.py`. Далее **bnb/** обозначает этот каталог bitsandbytes.
+
+Дополнительно прочитан [csrc/kernels.cu тега 0.50.2](https://github.com/bitsandbytes-foundation/bitsandbytes/blob/0.50.2/csrc/kernels.cu),
+сохранённый в `/private/tmp/s021-bnb-kernels.cu`, SHA256
+`a88d7a522b21b3d6e50cacad890c0c3ac44ad17b5f205c4b34ae91995ba1e5d6`.
+Номера строк ниже взяты из скачанных файлов, а solution — из `git show <commit>:<path>`.
+Python urllib первоначально не прошёл локальную проверку сертификата; штатный
+curl успешно скачал файлы с обычной TLS-проверкой, без отключения верификации.
+Torch/CUDA локально не исполнялись.
+
+### P2-021-1 — functional NF4 с out= выделяет лишний полный выход и копирует его
+
+- **Файл:строка:** `solution/nf4_patch.py:63`–`:67` в d228f99;
+  `solution/kernels/nf4.py:124`.
+- **Доказательство:** даже если caller передал подходящий `out`, wrapper сначала
+  вызывает `dequantize_nf4`, который делает `torch.empty(shape)` и декодирует туда,
+  затем выполняет `out.copy_(...)`. Оригинальный
+  `bnb/functional.py:1058`–`:1061` вызывает `.out` dispatcher, который пишет прямо
+  в предоставленный буфер (`bnb/backends/cuda/ops.py:437`–`:451`).
+  При shape=(8960,1536) лишний output — **27,525,120 bytes = 26.25 MiB** плюс
+  полный copy. Это расчёт по dtype/shape, не измеренный пик.
+- **Как проверить на T4:** сравнить peak allocation и output storage при
+  native/patched `functional.dequantize_4bit(packed, state, out=preallocated)`;
+  output должен содержать те же fp16 bits, но patched путь сейчас имеет второй
+  shape-sized allocation. Существующий integration NF4 test проверяет alias и
+  значения out, но не allocation.
+- **Минимальное исправление:** дать nested decoder поддерживаемый destination
+  buffer и писать прямо в out; сохранить исходную transpose-view семантику.
+- **Влияние:** численные значения не меняет; лишние память и bandwidth только
+  у functional out= пути. Целевой MatMul4Bit.backward не передаёт out, а backend
+  wrapper уже пишет в out напрямую: регресс именно этого целевого train path
+  данной находкой не доказан.
+
+### P2-021-2 — non-nested functional fallback всё равно может запускать собственный flat NF4
+
+- **Файл:строка:** `solution/nf4_patch.py:55`–`:58`, `:75`–`:84`;
+  `solution/tests/test_nf4.py:143`–`:145` (FP4 routing), `:155`–`:159` (direct state rejection).
+- **Доказательство:** `_validate_state` отклоняет nested=False, wrapper вызывает
+  saved `original_f`, но тот через `.default`/`.out` dispatcher вызывает **уже
+  заменённый** backend global `_dequantize_4bit_impl` (bnb functional:1058–1070,
+  backend:423–451). При NF4/block64/fp16 с обычными fp32 absmax `_validate_flat`
+  проходит, и собственный kernel запускается с `NESTED=False`.
+  Для FP4 оба wrapper действительно возвращаются в original; этот случай
+  покрыт test. Для non-nested NF4 аналогичного routing test нет.
+- **Оценка:** это не обнаруженное изменение значений — flat decoder как раз
+  реализует ту же формулу и не знает, были scales nested раньше или нет.
+  Но утверждение «не-nested вообще остаётся на прежней реализации» неверно,
+  и fallback на functional-уровне сам по себе не доказывает отсутствие launches.
+- **Как проверить на T4:** расширить LaunchSpy из
+  `test_patch_covers_functional_dispatcher_forward_and_backward`: quantize NF4
+  с `compress_statistics=False`, сохранить native bits, установить patch,
+  вызвать functional и сравнить bits/список NESTED launches. Ожидаемый по коду
+  launch — `[False]`, а не пустой список. Здесь не запускалось.
+- **Минимальное решение:** явно документировать/test побитовую совместимость
+  non-nested flat NF4 как поддерживаемого backend случая. Если требуется строго
+  не трогать этот путь, нужен scoped bypass backend wrapper при таком functional
+  fallback; не отключать глобально backend hook для всего обучения.
+- **Влияние:** потенциальная разница latency/kernel share вне nested task;
+  численного дефекта для корректного non-nested NF4 не найдено. Нельзя назвать
+  это P1 для текущей double-quant задачи без дополнительных доказательств.
+
+### P2-021-3 — новый bitwise CE test доказывает совпадение одинаковых chunk GEMM, не полной головы
+
+- **Файл:строка:** `solution/tests/test_cross_entropy.py:162`–`:216` в 8f8ebbc;
+  fixture `:39`–`:48` и reference `:69`–`:73`.
+- **Доказательство:** новый test сравнивает torch.mm с F.linear на **том же**
+  chunk shape и затем использует те же Triton online-statistics kernels для
+  expected/actual. Это полезная проверка GEMM dtype/dispatch, но не независимый
+  oracle всех статистик. Его shape N=77,V=4103 также не является полной
+  тренировочной головой V=151936. Большинство остальных correctness tests
+  fixture запускает с reduced-precision reduction=False, а parametrized test
+  отдельно включает True/False только для этого chunk сравнения.
+- **Минимальное действие:** дополнить проверкой loss/entropy/argmax против
+  независимого full-vocabulary F.linear+CE/softmax при штатных backend flags
+  и representative rows, затем paired checks 5–7 на T4. Не менять flags
+  настоящего baseline или допуски ради прохождения теста.
+- **Влияние:** production-код не меняется; это граница доказательства, не
+  обнаруженный numerical fail. Выбор алгоритма cuBLAS зависит от форм, поэтому
+  переход к native fp16 output сам по себе не обещает bitwise равенства
+  чанковой и полной головы. Конечные потери и quality всё ещё проверяет harness.
+
+### NF4: проверенные свойства и остаточные границы
+
+| Требование | Результат и доказательство |
+| --- | --- |
+| Упаковка | High nibble даёт более ранний элемент, low nibble — следующий. Совпадает с quantize/dequantize ветками официального csrc и `nf4_decode_kernel:42`–`:44`. Локально проверены все 256 пар кодов байта. |
+| Таблица NF4 | AST `_NF4_VALUES` сравнен с `nf4_dequantization_lut` скачанного тега: **16/16 float32 bit patterns совпадают**, через `struct.pack('f')`, без GPU. |
+| Nested scales | `code2[qabs[block]] * absmax2[block//256]`, затем offset, всё fp32; `enable_fp_fusion=False` на обоих launch sites. Это согласуется с отдельным fp32 blockwise output, затем offset-add в `bnb/functional.py:1052`–`:1056`. Flat backend получает уже восстановленные scales. |
+| Transpose | Decoder создаёт state.shape, затем возвращает `.t()` только при packed.shape[0]==1; original functional имеет тот же BC shim `:1072`–`:1077`. В forward/backward MatMul4Bit packed B нормализуется в canonical [-1,1], поэтому обычный training output не транспонируется повторно. out= сохраняет view/alias, но имеет P2-021-1. |
+| Хвосты | `index<N` маскирует Packed/Abs/Scale2/Code2/Table и store; последний нечётный элемент использует high nibble существующего последнего байта. `_validate_state` требует packed bytes >= ceil(N/2), absmax >= ceil(N/64), state2 absmax >= ceil(blocks/256). Не обнаружено OOB для принятых состояний. |
+| Offsets | Для максимального из заданных весов 8960×1536: N=13,762,560, packed bytes=6,881,280, scales=215,040, second-level scales=840. Все element/byte offsets далеко ниже int32 limit, без произведения batch×vocabulary. Для произвольно огромного стороннего API-веса >2³¹ guards не предусмотрены; это не размер фиксированного task. |
+| Functional hook | `MatMul4Bit.backward` читает `F.dequantize_4bit` при каждом вызове: **bnb/autograd/_functions.py:384**. F — модуль functional, не захваченная отдельная функция. Hook действительно покрывает этот backward. |
+| Backend hook | `_dequant_linear_fallback` вызывает global `_dequantize_4bit_impl`: `bnb/backends/cuda/ops.py:905`–`:916`; оба registered dequantize operators также используют global. Замена helper покрывает их без перерегистрации torch operators. |
+| Какие forward не покрыты | Custom fused GEMM/GEMV не обязаны вызывать decoder. Для CUDA M>1536 backend безусловно выбирает fallback (`ops.py:924`, `:953`–`:954`); более короткие batch shapes зависят от heuristic/выравнивания. Поэтому «NF4 patch ускоряет любой forward» было бы неверно. |
+| Unsupported states | Functional проверяет quant_type/nested/blocksize/dtypes/state2/buffers; backend проверяет quant_type/blocksize/output dtype и buffer layout. Version gate точный 0.50.2, CPU/disabled возвращаются в original. FP4 остаётся original в обоих местах; non-nested routing — P2-021-2. Ошибки kernel/compiler не скрываются широким except. |
+| Реальная регистрация | Installer `patch_bnb_dequant` идемпотентный и ставит обе точки. В проверенном committed `solution/patch.py` **нет его вызова**. До явной интеграции kernel не участвует в default training; наличие installer не является evidence launches. Незакоммиченный S-016 в эту оценку не входит. |
+| Оригинальность/правила | NF4 likeness по актуальному harness=**0.4150**, ниже 0.8. Запрещённых импортов, измерительных ветвлений, package install и готовых compiled caches в этих файлах нет; LUT — данные формата, не чужая реализация. Per-device LUT cache фиксированного размера и не хранит веса/hidden rows. |
+
+NF4 GPU tests корректно снимают **обе** обёртки при построении native oracle;
+используют int16 view, чтобы различать signed zero; проверяют реальные размеры,
+нечётные хвосты, transpose, FP4 fallback, functional out=, dispatcher, forced
+M=1537 fallback и backward с LaunchSpy. Это содержательные acceptance tests,
+но их наличие не заменяет лог выполнения на T4. Новых замеров NF4 этим ревью нет.
+
+### CE: dtype, compaction, P1-1 и память
+
+- **Логиты:** `cross_entropy.py:149`, `:195` теперь вызывают fp16-input
+  `torch.mm` **без** fp32 out_dtype; результат fp16, затем kernels загружают
+  его в fp32. Это та же категория операции, что bias-free F.linear над
+  этими operands. Production-код не меняет reduced-precision reduction flags;
+  FP32 выход используется только для dX GEMM `:202`. Полного bitwise совпадения
+  с полной головой другой формы не утверждаю, см. P2-021-3.
+- **Online statistics:** fp16 load и `other=-inf` корректны: half допускает -inf;
+  после promote masked p=0, а weighted term умножает p на `where(col<Width,z,0)`.
+  Поэтому NaN от `0*(-inf)` на замаскированном хвосте не возникает. FIRST/последующие chunks,
+  target_z, tie argmax и output mask остались согласованными.
+- **Compaction:** `nonzero(targets != ignore_index)` даёт уникальные возрастающие
+  row indices; index_select одинаков для hidden/targets/lse/upstream. При CUDA
+  nonzero требует host-visible dynamic result и является sync; `.numel()` уже
+  не дополнительный value `.item()` sync. Он вызывается один раз до vocab loop,
+  в том числе для all-valid batch. All-valid skips gathers/scatter, но не
+  nonzero; partial-valid scatter пишет ровно выбранные строки, остальные нули.
+- **Пустые/полные наборы:** n=0 возвращает пустой zero gradient; valid_n=0
+  возвращает zero gradient без gain и без backward GEMMs; valid_n=n использует
+  исходные tensors. В partial случае original labels/entropy/argmax в forward
+  не компактизируются: assistant/padding mask не удаляет нужные TRL statistics.
+- **P1-1 закрыт в коде:** `:175`–`:178` возвращает нули до любого nonfinite
+  вычисления, а `:183`–`:186` исключает ignored upstream из gain. Бывший
+  `0*inf` после ignored dz невозможен для этих строк. Валидные строки с
+  собственным nonfinite upstream по-прежнему могут давать nonfinite dX, как
+  ожидается от такого входа; они не маскируются без основания. Scalar loss
+  denominator не менялся: all-ignored mean loss остаётся baseline NaN.
+- **Dtype dX:** accumulator fp32; перед return/scatter `:206` приводит к
+  ctx.hidden_dtype, а full zero output `:208` выделяется сразу в том же dtype.
+  fp16 ingress и исходный fp32 hidden поэтому получают соответствующий dX.
+  Higher-order backward по-прежнему явно не поддерживается.
+- **Сохранения/гонки:** сохранены hidden fp16, frozen weight reference, targets,
+  lse; chunk z/dz/w/contribution не сохраняются между вызовами. Distinct
+  nonzero indices исключают collision scatter. Чтение/запись chunks и kernels
+  идут в текущем stream, state между ними остаётся упорядоченным.
+
+**Память, статический расчёт для N=2048,H=1536,chunk=4096** (не замер):
+
+| Одновременно живые временные тензоры | Объём |
+| --- | ---: |
+| w cast fp16 | 12 MiB |
+| z fp16, каждая chunk аллокация | 16 MiB |
+| dz fp16 | 16 MiB |
+| dx accumulator fp32 | 12 MiB |
+| Наибольшая сумма до `del z`: w+z+dz+dx | **56 MiB** |
+| После `del z`: w+dz+contribution(fp32)+dx | **52 MiB** |
+
+Это согласуется с docstring, если не включать inputs/outputs/cuBLAS workspace.
+При partial compaction добавляется fp16 work_hidden (менее 6 MiB для valid_n<N)
+и O(N) row vectors; old full saved hidden остаётся входом backward. При
+scatter full_dx выделяется **после** удаления chunk temporaries. Эти extra
+buffers явно названы в docstring, поэтому 56 MiB не надо выдавать за полный
+peak всего backward. Если исходный hidden fp32, его forward cast отдельно
+занимает 6 MiB. `_chunk_size` ограничивает z ≤64 MiB и w cast ≤32 MiB,
+для task даёт chunk4096. Buffer-size нарушения/нового полного [N,V] allocation
+не найдено; nvidia-smi/PyTorch peak и cuBLAS workspace всё равно требуют T4.
+
+Compaction меняет M dX/logit GEMM и может менять cuBLAS algorithm, а nonzero
+добавляет sync. Ожидаемое сокращение GEMM работы — не доказанный speedup;
+сравнение wall/quality нового коммита со старым требуется отдельно.
+
+Существующие новые tests покрывают full/some/all ignored, zero denominator
+трёх видов, ignored inf/NaN/огромный upstream, один ignored inf среди valid,
+порядок/размер GEMM operands и обе настройки reduced precision. Kernel likeness
+в 8f8ebbc: statistics **0.1704**, outputs **0.4595**, derivative **0.2915**;
+автоматического сходства с примером выше порога нет.
+
+### Следующие точные проверки (предложены, здесь не запускались)
+
+```bash
+python -m pytest solution/tests/test_nf4.py -q -s
+python -m pytest solution/tests/test_cross_entropy.py -q -s
+python -m pytest solution -q
+SOUP_APPLY_SOLUTION=1 python -m pytest tests -q
+python harness/run_task.py --repeats 2 --out runs_s021
+python harness/check_rules.py --result runs_s021/result.json
+```
+
+NF4 pytest устанавливает patch вручную и проверяет охват, но default training
+без installer регистрации NF4 не измеряет. Для опыта с включённым NF4 сначала
+нужна принятая отдельная интеграция; не запускать hidden patches через notebook,
+которые отсутствуют в сдаваемом solution. Дополнить non-nested routing и out=
+allocation проверки, независимый default-flags full-vocabulary CE oracle,
+затем сохранить launches/own times и paired metrics нового снимка.
+
+Обновление прежнего P0-1 S-017: для **de836e0** уже получен отдельный full ×1
+`runs_kaggle/20261030T105526661826Z_full_de836e0/out/runs/checks.json` с 10/10 PASS
+и own share 8.6%; это закрывает прежнее отсутствие evidence именно для той пары.
+Ни NF4 d228f99, ни CE 8f8ebbc не наследуют это измерение автоматически.
