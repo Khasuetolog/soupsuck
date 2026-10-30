@@ -334,10 +334,172 @@ def benchmark_case(torch, case, args):
     return record
 
 
+def benchmark_nf4_gemm(torch, args, report, save):
+    """EXP-002, separate from the existing bitwise launch-geometry sweep.
+
+    Includes decoder+allocation+cuBLAS in each baseline invocation. Weights
+    are genuinely bnb nested NF4, not randomly fabricated metadata. A shape
+    is recommended only after every candidate passes the same fixed gate.
+    This writes recommendations, never a production dispatch table.
+    """
+    import bitsandbytes as bnb
+    from solution.kernels import nf4_gemm as fused
+    from solution.kernels.nf4 import dequantize_nf4
+
+    if bnb.__version__ != "0.50.2":
+        raise RuntimeError("EXP-002 requires bitsandbytes 0.50.2")
+    if torch.cuda.get_device_capability(0) != (7, 5):
+        raise RuntimeError("EXP-002 approval is specific to sm75")
+    report["kernels"] = ["nf4_tile_matmul_kernel"]
+    report["tolerance"] = dict(rtol=0.002, atol=0.002, relative_l2=0.001)
+    report["policy"] = "recommend only validated configs with candidate p90 < baseline p10"
+    report["production_dispatch_modified"] = False
+
+    def compare(actual, expected):
+        delta = actual.float() - expected.float()
+        result = dict(max_abs=float(delta.abs().max()),
+                      relative_l2=float(delta.norm() / expected.float().norm().clamp_min(1e-30)),
+                      exact=bool(torch.equal(actual, expected)), finite=bool(torch.isfinite(actual).all()))
+        torch.testing.assert_close(actual, expected, rtol=0.002, atol=0.002)
+        if not result["finite"] or result["relative_l2"] > 0.001:
+            raise AssertionError(f"GEMM fixed correctness gate failed: {result}")
+        return result
+
+    def timed(call):
+        begin = time.perf_counter()
+        for _ in range(args.warmup):
+            call()
+        torch.cuda.synchronize()
+        warmup_s = time.perf_counter() - begin
+        samples = []
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        for _ in range(args.repeats):
+            start.record()
+            output = call()
+            end.record()
+            end.synchronize()
+            samples.append(start.elapsed_time(end))
+            del output
+        ordered = sorted(samples)
+        return dict(median_ms=statistics.median(samples), p10_ms=ordered[int((len(samples)-1)*0.1)],
+                    p90_ms=ordered[int((len(samples)-1)*0.9)], samples_ms=samples, warmup_s=warmup_s)
+
+    for n, k in ((1536, 1536), (256, 1536), (8960, 1536), (1536, 8960)):
+        weight = torch.randn((n, k), device="cuda", dtype=torch.float16) * 0.02
+        packed, state = bnb.functional.quantize_4bit(
+            weight, blocksize=64, compress_statistics=True, quant_type="nf4")
+        del weight
+        dense = dequantize_nf4(packed.view(-1, 1), state)
+        native_dense = bnb.functional.dequantize_4bit(packed.view(-1, 1), state)
+        if not torch.equal(dense.view(torch.uint8), native_dense.view(torch.uint8)):
+            raise AssertionError("Nested decoder does not match native NF4 weights bitwise")
+        del native_dense
+        for m in args.rows:
+            records = {}
+            for transpose, biased in ((False, False), (False, True), (True, False)):
+                x = torch.randn((1, m, n if transpose else k), device="cuda", dtype=torch.float16) * 0.1
+                bias = torch.randn(n, device="cuda", dtype=torch.float16) * 0.01 if biased else None
+                def baseline():
+                    decoded = dequantize_nf4(packed.view(-1, 1), state)
+                    return torch.matmul(x, decoded) if transpose else torch.nn.functional.linear(x, decoded, bias)
+                key = f"nf4-gemm/M{m}/N{n}/K{k}/{'dx' if transpose else 'forward'}/bias{biased}"
+                record = dict(case=key, kernel="nf4_tile_matmul_kernel", M=m, N=n, K=k,
+                              transpose=transpose, bias=biased, candidates=[], ok=False)
+                report["active_case"] = key
+                report["cases"].append(record)
+                save()
+                first = time.perf_counter()
+                reference = baseline()
+                torch.cuda.synchronize()
+                record["baseline_first_call_s"] = time.perf_counter() - first
+                # Both baselines and candidates are timed in this same session;
+                # no result is inferred by comparing different Kaggle hosts.
+                record["baseline"] = timed(baseline)
+                if not transpose:
+                    # bnb may already select its own fused MMA below M=1536.
+                    # A decode+cuBLAS win alone cannot authorize replacing it.
+                    native = getattr(bnb.matmul_4bit, fused._MARKER, bnb.matmul_4bit)
+                    record["native_bnb"] = timed(lambda: native(x, packed, state, bias=bias))
+                for config in fused.CONFIGS:
+                    trial = dict(config=config, correct=False)
+                    try:
+                        first = time.perf_counter()
+                        actual = fused.nf4_matmul(x, packed, state, transpose=transpose,
+                                                  bias=bias, config=config)
+                        torch.cuda.synchronize()
+                        trial["first_call_s"] = time.perf_counter() - first
+                        trial.update(compare(actual, reference))
+                        trial["correct"] = True
+                        del actual
+                        trial.update(timed(lambda: fused.nf4_matmul(
+                            x, packed, state, transpose=transpose, bias=bias, config=config)))
+                    except Exception as error:
+                        trial["error"] = f"{type(error).__name__}: {error}"[:3000]
+                        if any(term in str(error).lower() for term in
+                               ("illegal memory access", "device-side assert", "misaligned address", "launch failure")):
+                            record["candidates"].append(trial)
+                            save()
+                            raise
+                    record["candidates"].append(trial)
+                    print(json.dumps(dict(case=key, **trial)), flush=True)
+                    save()
+                correct = [r for r in record["candidates"] if r["correct"] and "median_ms" in r]
+                if correct:
+                    best = min(correct, key=lambda r: r["median_ms"])
+                    record["best"] = dict(config=best["config"], median_ms=best["median_ms"],
+                                          baseline_ms=record["baseline"]["median_ms"],
+                                          speedup=record["baseline"]["median_ms"]/best["median_ms"])
+                    record["recommend"] = best["p90_ms"] < record["baseline"]["p10_ms"]
+                    if "native_bnb" in record:
+                        record["recommend"] &= best["p90_ms"] < record["native_bnb"]["p10_ms"]
+                    record["ok"] = True
+                    records[(transpose, biased)] = best["config"]
+                save()
+                del x, reference, bias
+            # Verify the actual optional bnb/autograd bridge in BOTH derivative
+            # directions. Forced configs exist only in this benchmark process.
+            if all(key in records for key in ((False, False), (False, True), (True, False))):
+                saved_flag = os.environ.get("SOUP_EXP_NF4_GEMM")
+                saved_shapes = dict(fused.APPROVED_SHAPES)
+                try:
+                    os.environ["SOUP_EXP_NF4_GEMM"] = "1"
+                    fused.patch_nf4_matmul(bnb)
+                    for fw, bw in ((True, False), (False, True), (True, True)):
+                        fused.APPROVED_SHAPES.clear()
+                        if fw:
+                            fused.APPROVED_SHAPES[(m, n, k, False)] = records[(False, True)]
+                        if bw:
+                            fused.APPROVED_SHAPES[(m, n, k, True)] = records[(True, False)]
+                        x = (torch.randn((1, m, k), device="cuda", dtype=torch.float16) * 0.1).requires_grad_()
+                        other = x.detach().clone().requires_grad_()
+                        bias = torch.randn(n, device="cuda", dtype=torch.float16) * 0.01
+                        expected = torch.nn.functional.linear(x, dense, bias)
+                        actual = bnb.matmul_4bit(other, packed, state, bias=bias)
+                        grad = torch.randn_like(actual) * 0.1
+                        expected.backward(grad)
+                        actual.backward(grad)
+                        report.setdefault("autograd", []).append(dict(M=m, N=n, K=k, forward=fw,
+                            backward=bw, output=compare(actual, expected), dx=compare(other.grad, x.grad)))
+                finally:
+                    fused.APPROVED_SHAPES.clear()
+                    fused.APPROVED_SHAPES.update(saved_shapes)
+                    if saved_flag is None:
+                        os.environ.pop("SOUP_EXP_NF4_GEMM", None)
+                    else:
+                        os.environ["SOUP_EXP_NF4_GEMM"] = saved_flag
+                save()
+        del dense, packed, state
+        gc.collect()
+    report["ok"] = bool(report["cases"]) and all(r["ok"] for r in report["cases"])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=Path("out"))
     parser.add_argument("--list", action="store_true", help="Print the kernel/shape plan without importing torch")
+    parser.add_argument("--nf4-gemm", action="store_true",
+                        default=os.environ.get("SOUP_EXP_NF4_GEMM") == "1",
+                        help="EXP-002: fused NF4 GEMM vs decode+cuBLAS (also selected by experiment flag)")
     parser.add_argument("--kernels", default="", help="Optional comma-separated exact kernel names")
     parser.add_argument("--rows", type=int, nargs="+", default=[2048, 800])
     parser.add_argument("--repeats", type=int, default=20)
@@ -350,8 +512,10 @@ def main():
     if args.commit and not re.fullmatch(r"[0-9a-f]{40}", args.commit):
         parser.error("--commit must be a full lowercase git SHA")
     if args.list:
-        print(json.dumps(dict(kernels=sorted(selected), rows=args.rows, H=1536, I=8960, V=151936,
-                              samples=args.repeats, policy="bitwise-exact candidates only"), indent=2))
+        print(json.dumps(dict(kernels=["nf4_tile_matmul_kernel"] if args.nf4_gemm else sorted(selected),
+                              rows=args.rows, H=1536, I=8960, V=151936, samples=args.repeats,
+                              policy="EXP-002 fixed fp16 GEMM tolerance" if args.nf4_gemm
+                              else "bitwise-exact candidates only"), indent=2))
         return 0
     args.out.mkdir(parents=True, exist_ok=True)
     report = dict(ok=False, cases=[], kernels=sorted(selected), rows=args.rows,
@@ -389,6 +553,9 @@ def main():
                     report["commit"] = revision.stdout.strip() if revision.returncode == 0 else None
                 except FileNotFoundError:
                     report["commit"] = None
+            if args.nf4_gemm:
+                benchmark_nf4_gemm(torch, args, report, save)
+                return 0 if report["ok"] else 1
             seen = set()
             for case in cases(torch, triton, args.rows):
                 if case.kernel.__name__ not in selected:

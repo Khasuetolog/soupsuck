@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
 import importlib
+import os
 from types import ModuleType
 
 from .utils import enabled
@@ -117,4 +118,8 @@ def patch_bnb_dequant():
 
         setattr(linear_fallback, _MARKER, original_linear)
         backend._dequant_linear_fallback = linear_fallback
+    if os.environ.get("SOUP_EXP_NF4_GEMM") == "1":
+        from .kernels.nf4_gemm import patch_nf4_matmul
+
+        patch_nf4_matmul(bnb)
     return True
