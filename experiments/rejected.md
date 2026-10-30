@@ -1,0 +1,3 @@
+# Rejected experiments
+
+(none yet)
