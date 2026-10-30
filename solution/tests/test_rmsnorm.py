@@ -181,3 +181,68 @@ def test_invalid_layout_and_cpu_raise_value_error():
     leading = torch.randn((3, 4, 1000), device="cuda").transpose(0, 1)
     with pytest.raises(ValueError, match="2-D"):
         rms_norm(leading, torch.ones(1000, device="cuda"), 1e-6)
+
+
+@pytest.mark.parametrize("input_dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("weight_dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("train_weight", [False, True])
+def test_fused_output_half_rounding_and_gradients(input_dtype, weight_dtype, train_weight):
+    from solution.kernels.rmsnorm import rms_norm
+
+    torch.manual_seed(692)
+    x = torch.randn(2, 17, 1536, device="cuda", dtype=input_dtype, requires_grad=True)
+    weight = torch.randn(1536, device="cuda", dtype=weight_dtype, requires_grad=train_weight)
+    xr = x.detach().clone().requires_grad_()
+    wr = weight.detach().clone().requires_grad_(train_weight)
+    actual = rms_norm(x, weight, 1e-6, out_dtype=torch.float16)
+    # The new option changes only the final store dtype: the same kernel's
+    # uncast result is a strict oracle, irrespective of fp32 reduction order.
+    exact = rms_norm(x.detach(), weight.detach(), 1e-6)
+    torch.testing.assert_close(actual, exact.half(), rtol=0, atol=0)
+    reference = _qwen2_reference(xr, wr, 1e-6).half()
+    torch.testing.assert_close(actual, reference, **FP16_TOL)
+    grad = torch.randn_like(actual)
+    actual.backward(grad)
+    reference.backward(grad)
+    assert x.grad.dtype == input_dtype
+    torch.testing.assert_close(x.grad, xr.grad, **FP16_TOL)
+    if train_weight:
+        torch.testing.assert_close(weight.grad, wr.grad, **FP16_TOL)
+    else:
+        assert weight.grad is None
+
+
+@pytest.mark.parametrize("input_dtype", [torch.float32, torch.float16])
+def test_fused_half_output_bitwise_qwen_reference(input_dtype):
+    from solution.kernels.rmsnorm import rms_norm
+
+    # Exact row variances and half-representable gamma keep this cast check
+    # independent of fp32 reduction-tree differences near half midpoints.
+    x = torch.tensor([[1, -1, 1, -1] * 20, [2, -2, 2, -2] * 20],
+                     device="cuda", dtype=input_dtype)
+    weight = torch.tensor([0.5, 1, 1.5, 2] * 20, device="cuda", dtype=torch.float32)
+    actual = rms_norm(x, weight, 1e-6, out_dtype=torch.float16)
+    torch.testing.assert_close(actual, _qwen2_reference(x, weight, 1e-6).half(), rtol=0, atol=0)
+
+
+def test_half_output_sequence_lengths_reuse_variants():
+    from solution.kernels.rmsnorm import (rms_norm, rmsnorm_forward_kernel,
+                                        rmsnorm_input_gradient_kernel, rmsnorm_weight_partials_kernel,
+                                        rmsnorm_weight_finalize_kernel)
+
+    device = torch.cuda.current_device()
+    kernels = (rmsnorm_forward_kernel, rmsnorm_input_gradient_kernel,
+               rmsnorm_weight_partials_kernel, rmsnorm_weight_finalize_kernel)
+    def count(kernel):
+        entry = kernel.device_caches.get(device)
+        return len(entry[0]) if entry is not None else 0
+    before = {kernel.__name__: count(kernel) for kernel in kernels}
+    weight = torch.ones(1536, device="cuda", requires_grad=True)
+    for sequence in (17, 32, 77, 128, 257):
+        x = torch.randn(4, sequence, 1536, device="cuda", requires_grad=True)
+        out = rms_norm(x, weight, 3e-5, out_dtype=torch.float16)
+        out.backward(torch.randn_like(out))
+        weight.grad = None
+    torch.cuda.synchronize()
+    for kernel in kernels:
+        assert count(kernel) - before[kernel.__name__] <= 2, kernel.__name__

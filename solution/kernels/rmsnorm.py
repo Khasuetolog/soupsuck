@@ -1,10 +1,11 @@
 """Qwen2 RMSNorm with explicit cast order and an optional weight gradient.
 
 Let r=rsqrt(mean(x**2)+eps), a=x*r in fp32 and q=cast(a, x.dtype).
-Forward returns weight*q in torch.promote_types(x.dtype, weight.dtype).
+Forward returns weight*q in torch.promote_types(x.dtype, weight.dtype), or
+rounds that exact result to fp16 when out_dtype=torch.float16 is requested.
 The cast's backward first gives u=cast(g*weight, x.dtype), promoted to fp32;
 dx=r*(u-a*mean(u*a)). The Jacobian uses unrounded a, while dweight=sum(g*q)
-uses rounded q. If the output is fp16, each g*q product is rounded to fp16
+uses rounded q. If the original promoted output is fp16, each g*q product is rounded to fp16
 before the fp32 row reduction, matching PyTorch's multiply-before-broadcast-sum.
 
 For sm_75, H=1536 uses one program per row, BLOCK=2048, four warps; this
@@ -103,12 +104,13 @@ def rmsnorm_weight_finalize_kernel(Partial, Dw, GROUPS, H: tl.constexpr,
 
 class _RMSNorm(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, eps):
+    def forward(ctx, x, weight, eps, out_dtype):
         h = x.shape[-1]
         rows = math.prod(x.shape[:-1])
         block = triton.next_power_of_2(h)
         warps = 4 if block <= 4096 else 8
-        out = torch.empty(x.shape, device=x.device, dtype=torch.promote_types(x.dtype, weight.dtype))
+        ctx.exact_dtype = torch.promote_types(x.dtype, weight.dtype)
+        out = torch.empty(x.shape, device=x.device, dtype=out_dtype or ctx.exact_dtype)
         rstd = torch.empty(rows, device=x.device, dtype=torch.float32)
         if rows:
             matrix = x if x.ndim == 2 else x.view(rows, h)
@@ -124,7 +126,7 @@ class _RMSNorm(torch.autograd.Function):
     @once_differentiable
     def backward(ctx, grad):
         if grad is None:
-            return None, None, None
+            return None, None, None, None
         x, weight, rstd = ctx.saved_tensors
         h, rows = x.shape[-1], ctx.rows
         dx, dw = None, None
@@ -145,22 +147,26 @@ class _RMSNorm(torch.autograd.Function):
                 partial = torch.empty((groups, h), device=x.device, dtype=torch.float32)
                 rmsnorm_weight_partials_kernel[(groups, triton.cdiv(h, 128))](
                     matrix, gmatrix, rstd, partial, rows, matrix.stride(0), gmatrix.stride(0),
-                    gmatrix.stride(1), h, grad.dtype == torch.float16,
+                    # A final fp16 output cast has an fp32 backward cast when
+                    # the original norm promoted to fp32. Do not introduce a
+                    # half-rounded g*q product merely because grad is fp16.
+                    gmatrix.stride(1), h, ctx.exact_dtype == torch.float16,
                     ROWS=32, COLS=128, num_warps=4, enable_fp_fusion=False)
                 rmsnorm_weight_finalize_kernel[(triton.cdiv(h, 32),)](
                     partial, dw, groups, h, BLOCK_R=128, BLOCK_C=32,
                     num_warps=4, enable_fp_fusion=False)
             else:
                 dw.zero_()
-        return dx, dw, None
+        return dx, dw, None, None
 
 
-def rms_norm(x, weight, eps):
+def rms_norm(x, weight, eps, out_dtype=None):
     """Normalize the last contiguous dimension, preserving Qwen2 cast semantics.
 
     Supports fp16/fp32 CUDA input with contiguous storage or a 2-D strided
     row layout, and a one-dimensional fp16/fp32 weight. Contiguous inputs may
     have arbitrary leading shapes. Only first-order gradients are supported.
+    out_dtype=None preserves promotion; torch.float16 fuses the final cast.
     Invalid inputs raise ValueError; callers choose any fallback explicitly.
     """
     if x.ndim < 1 or x.shape[-1] == 0 or weight.ndim != 1 or weight.shape[0] != x.shape[-1]:
@@ -175,5 +181,7 @@ def rms_norm(x, weight, eps):
         raise ValueError("RMSNorm supports only fp16/fp32 input and weight")
     if not isinstance(eps, numbers.Real) or not math.isfinite(eps) or eps < 0:
         raise ValueError("eps must be a finite nonnegative scalar")
+    if out_dtype not in (None, torch.float16):
+        raise ValueError("out_dtype must be None or torch.float16")
     with torch.cuda.device(x.device):
-        return _RMSNorm.apply(x, weight, eps)
+        return _RMSNorm.apply(x, weight, eps, out_dtype)

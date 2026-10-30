@@ -26,13 +26,14 @@ validation; no bitwise end-to-end equivalence is claimed for fp16 input.
 from functools import wraps
 import math
 import numbers
+import sys
 
 from .utils import enabled, supported_tensor
 
 _MARKER = "_solution_lora_4bit_original"
 
 
-def _eligible(layer, x, kwargs):
+def _eligible(layer, x, kwargs, *, _input_dtype=None):
     import torch
 
     if (not enabled() or not supported_tensor(x) or x.ndim == 0
@@ -41,7 +42,8 @@ def _eligible(layer, x, kwargs):
             or layer.disable_adapters or layer.merged
             or len(layer.active_adapters) != 1):
         return False
-    if (x.dtype == torch.float16 and hasattr(layer.base_layer, "compute_dtype")
+    input_dtype = x.dtype if _input_dtype is None else _input_dtype
+    if (input_dtype == torch.float16 and hasattr(layer.base_layer, "compute_dtype")
             and layer.base_layer.compute_dtype != torch.float16):
         # The norm-to-fp16 optimization assumes the base linear itself computes
         # in fp16; do not silently extend it to fp32/bf16/auto bnb computation.
@@ -63,10 +65,36 @@ def _eligible(layer, x, kwargs):
         return torch.get_autocast_dtype("cuda") == torch.float16
     # Outside AMP, match PEFT's explicit input conversion. For fp16 ingress
     # require fp32 A/B, so restoring fp32 dropout doesn't feed a half GEMM.
-    if x.dtype == torch.float16:
+    if input_dtype == torch.float16:
         return (a.weight.dtype == b.weight.dtype == torch.float32
                 and getattr(layer, "cast_input_dtype_enabled", True))
     return True
+
+
+def fp16_ingress_ready(layer, x):
+    """Certify the actual registered vanilla bnb forward before changing norm dtype.
+
+    Qwen2Attention calls q_proj/k_proj/v_proj without kwargs. Reject hooks or
+    instance overrides that could inject mixed-adapter/variant arguments after
+    this check. Prediction uses the future fp16 dtype without allocating a cast.
+    """
+    import torch
+
+    module = sys.modules.get("peft.tuners.lora.bnb")
+    cls = getattr(module, "Linear4bit", None)
+    if (type(layer) is not cls or not hasattr(cls.forward, _MARKER)
+            or "forward" in layer.__dict__
+            or layer._forward_hooks or layer._forward_pre_hooks
+            or layer._backward_hooks or layer._backward_pre_hooks):
+        return False
+    base = layer.base_layer
+    if (type(base).__module__ != "bitsandbytes.nn.modules" or type(base).__name__ != "Linear4bit"
+            or base.compute_dtype != torch.float16 or not base.compute_type_is_set
+            or "forward" in base.__dict__ or base._forward_hooks or base._forward_pre_hooks
+            or base._backward_hooks or base._backward_pre_hooks
+            or getattr(base.weight, "quant_state", None) is None):
+        return False
+    return _eligible(layer, x, {}, _input_dtype=torch.float16)
 
 
 def _patch_class(cls, variant_kwarg_keys):

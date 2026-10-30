@@ -99,6 +99,106 @@ def test_trl_import_callback_finds_hf_trainer_through_base_trainer(monkeypatch):
     assert cls.compute_loss is patched
 
 
+def test_half_norm_scope_is_owned_and_restored():
+    from solution.patch import _HALF_NORM, _half_norm_scope
+
+    first, second = object(), object()
+    assert _HALF_NORM.get() is None
+    with _half_norm_scope(first):
+        assert _HALF_NORM.get() is first
+        with _half_norm_scope(second):
+            assert _HALF_NORM.get() is second
+        assert _HALF_NORM.get() is first
+        with pytest.raises(ValueError), _half_norm_scope(second):
+            raise ValueError("restore on failure")
+        assert _HALF_NORM.get() is first
+    assert _HALF_NORM.get() is None
+
+
+def test_post_norm_guard_rejects_dense_fp32_without_autocast(monkeypatch):
+    """CPU metadata regression for REVIEW P1-2; no torch installation needed."""
+    import solution.patch as patch
+
+    class Module:
+        def __init__(self):
+            self._forward_hooks = {}
+            self._forward_pre_hooks = {}
+            self._backward_hooks = {}
+            self._backward_pre_hooks = {}
+    class Linear(Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = SimpleNamespace(device="cuda:0")
+    precision = {"amp": False}
+    fake = SimpleNamespace(nn=SimpleNamespace(Module=Module, Linear=Linear), float16="fp16",
+                           is_autocast_enabled=lambda device: precision["amp"],
+                           get_autocast_dtype=lambda device: "fp16")
+    monkeypatch.setitem(sys.modules, "torch", fake)
+    monkeypatch.setattr(patch, "supported_tensor", lambda tensor: True)
+    monkeypatch.setattr(patch, "_half_norm_enabled", lambda norm: True)
+    cls = type("Qwen2MLP", (Module,), {"__module__": patch._QWEN_MODULE})
+    mlp = cls()
+    mlp.gate_proj, mlp.up_proj, mlp.down_proj = Linear(), Linear(), Linear()
+    layer = SimpleNamespace(post_attention_layernorm=object(), mlp=mlp)
+    x = SimpleNamespace(device="cuda:0")
+    assert not patch._post_norm_half_ready(layer, x)
+    precision["amp"] = True
+    assert patch._post_norm_half_ready(layer, x)
+    mlp.gate_proj._forward_pre_hooks["unknown"] = object()
+    assert not patch._post_norm_half_ready(layer, x)
+    precision["amp"] = False
+    class Linear4bit(Module):
+        __module__ = "bitsandbytes.nn.modules"
+        def __init__(self):
+            super().__init__()
+            self.compute_dtype, self.compute_type_is_set = "fp16", True
+            self.weight = SimpleNamespace(device="cuda:0", quant_state=object(), requires_grad=False)
+        def parameters(self):
+            return (self.weight,)
+    mlp.gate_proj, mlp.up_proj, mlp.down_proj = Linear4bit(), Linear4bit(), Linear4bit()
+    assert patch._post_norm_half_ready(layer, x)  # bnb itself casts without AMP
+    mlp.down_proj.compute_dtype = "fp32"
+    assert not patch._post_norm_half_ready(layer, x)
+    assert not patch._input_norm_half_ready(
+        SimpleNamespace(input_layernorm=object(), self_attn=object()), x, {})
+    assert not patch._final_norm_half_ready(
+        SimpleNamespace(model=SimpleNamespace(norm=object())), {})
+
+
+def test_nf4_registration_waits_for_both_modules_and_root(monkeypatch):
+    import solution.patch as patch
+
+    root = ModuleType("bitsandbytes")
+    root.__path__ = []
+    root.__spec__ = SimpleNamespace(_initializing=True)
+    functional = ModuleType("bitsandbytes.functional")
+    backend = ModuleType("bitsandbytes.backends.cuda.ops")
+    functional.dequantize_4bit = lambda: None
+    backend._dequantize_4bit_impl = lambda: None
+    monkeypatch.setitem(sys.modules, "bitsandbytes", root)
+    monkeypatch.setitem(sys.modules, functional.__name__, functional)
+    monkeypatch.delitem(sys.modules, backend.__name__, raising=False)
+    fake = ModuleType("solution.nf4_patch")
+    calls = []
+    def install():
+        if not hasattr(functional.dequantize_4bit, patch._MARKER):
+            setattr(functional.dequantize_4bit, patch._MARKER, True)
+            setattr(backend._dequantize_4bit_impl, patch._MARKER, True)
+            calls.append("installed")
+    fake.patch_bnb_dequant = install
+    monkeypatch.setitem(sys.modules, "solution.nf4_patch", fake)
+    patch._register_module(functional.__name__, functional)
+    assert not calls
+    monkeypatch.setitem(sys.modules, backend.__name__, backend)
+    patch._register_module(backend.__name__, backend)
+    assert not calls  # root is still initializing
+    patch._register_module(root.__name__, root)
+    assert calls == ["installed"]
+    root.__spec__._initializing = False
+    patch._register_module(functional.__name__, functional)
+    assert calls == ["installed"]
+
+
 def test_apply_with_fake_modules(monkeypatch):
     # Mirrors tests/test_trainer_init.py: these are not importable packages.
     import solution
@@ -399,6 +499,159 @@ def test_bridge_without_amp_preserves_dense_fallback(runtime, monkeypatch, capsy
     diagnostic = capsys.readouterr().err
     assert "fused head disabled: head: CUDA autocast is disabled" in diagnostic
     assert "fused head active" not in diagnostic
+
+
+def test_nf4_hooks_registered_after_bnb_import(runtime):
+    pytest.importorskip("bitsandbytes")
+    import solution
+    from bitsandbytes import functional
+    from bitsandbytes.backends.cuda import ops
+    from solution.nf4_patch import _MARKER
+
+    solution.apply()
+    assert hasattr(functional.dequantize_4bit, _MARKER)
+    assert hasattr(ops._dequantize_4bit_impl, _MARKER)
+    installed = functional.dequantize_4bit, ops._dequantize_4bit_impl
+    solution.apply()
+    assert installed == (functional.dequantize_4bit, ops._dequantize_4bit_impl)
+
+
+@pytest.mark.parametrize("training", [True, False])
+def test_dense_qwen_without_amp_keeps_all_norm_outputs_full_precision(runtime, monkeypatch, training):
+    torch, qwen, _, _ = runtime
+    import solution.kernels.rmsnorm as norms
+    import solution.kernels.add_rmsnorm as adds
+
+    model = _model(torch, qwen).train(training)
+    ids, labels, mask = _batch(torch)
+    requested = []
+    normal, additive = norms.rms_norm, adds.add_rms_norm
+    def normal_spy(x, weight, eps, out_dtype=None):
+        requested.append(out_dtype)
+        return normal(x, weight, eps, out_dtype)
+    def add_spy(r, d, weight, eps, out_dtype=None):
+        requested.append(out_dtype)
+        return additive(r, d, weight, eps, out_dtype)
+    monkeypatch.setattr(norms, "rms_norm", normal_spy)
+    monkeypatch.setattr(adds, "add_rms_norm", add_spy)
+    monkeypatch.delenv("SOUP_FUSED_NORM_FP16", raising=False)
+    assert not torch.is_autocast_enabled("cuda")
+    with torch.no_grad():
+        output = model(input_ids=ids, labels=labels, attention_mask=mask)
+    assert output.logits.dtype == torch.float32 and torch.isfinite(output.loss)
+    assert requested and all(dtype is None for dtype in requested)
+
+
+def test_input_final_half_norm_with_real_bnb_lora_preserves_dropout(runtime, monkeypatch):
+    """Compare the full fp32 norm path with scoped fp16 input/final norms."""
+    torch, qwen, _, _ = runtime
+    bnb = pytest.importorskip("bitsandbytes")
+    peft = pytest.importorskip("peft")
+    import solution
+    import solution.lora as lora
+    import solution.kernels.rmsnorm as norm_module
+    from solution.patch import _input_norm_half_ready
+
+    base = _model(torch, qwen)
+    # Convert precisely the three consumers of input_layernorm. Marking the
+    # model 4-bit makes PEFT select bnb before optional dense quantizer probes.
+    for block in base.model.layers:
+        for key in ("q_proj", "k_proj", "v_proj"):
+            old = getattr(block.self_attn, key)
+            quantized = bnb.nn.Linear4bit(old.in_features, old.out_features,
+                                         bias=old.bias is not None, compute_dtype=torch.float16,
+                                         compress_statistics=True, quant_type="nf4")
+            quantized.weight = bnb.nn.Params4bit(old.weight.detach().cpu(), requires_grad=False,
+                                                compress_statistics=True, quant_type="nf4")
+            if old.bias is not None:
+                quantized.bias = torch.nn.Parameter(old.bias.detach().cpu(), requires_grad=False)
+            setattr(block.self_attn, key, quantized.cuda())
+    base.is_loaded_in_4bit = True
+    wrapped = peft.get_peft_model(base, peft.LoraConfig(
+        task_type="CAUSAL_LM", r=4, lora_alpha=8, lora_dropout=0.05,
+        target_modules=["q_proj", "v_proj"],
+    )).train()
+    solution.apply()
+    with torch.no_grad():
+        for name, param in wrapped.named_parameters():
+            if "lora_B" in name:
+                param.normal_(0, 0.03)
+    ids, labels, mask = _batch(torch)
+    masks, requests, ingress = [], [], []
+    hooks = []
+    for index, block in enumerate(base.model.layers):
+        for key in ("q_proj", "v_proj"):
+            projection = getattr(block.self_attn, key)
+            def capture(module, args, output, label=(index, key)):
+                masks.append((label, args[0].dtype, (output.detach() != 0).clone()))
+            hooks.append(projection.lora_dropout["default"].register_forward_hook(capture))
+    norm_forward = norm_module.rms_norm
+    def observed_norm(x, weight, eps, out_dtype=None):
+        requests.append((id(weight), out_dtype))
+        return norm_forward(x, weight, eps, out_dtype=out_dtype)
+    monkeypatch.setattr(norm_module, "rms_norm", observed_norm)
+    eligibility = lora._eligible
+    def observed_ingress(layer, x, kwargs, **options):
+        ok = eligibility(layer, x, kwargs, **options)
+        if not options:  # actual forward, rather than prospective norm guard
+            ingress.append((x.dtype, ok))
+        return ok
+    monkeypatch.setattr(lora, "_eligible", observed_ingress)
+    initial = torch.cuda.get_rng_state()
+    try:
+        monkeypatch.setenv("SOUP_FUSED_NORM_FP16", "0")
+        with torch.autocast("cuda", dtype=torch.float16):
+            expected = wrapped(input_ids=ids, labels=labels, attention_mask=mask).loss
+        after_ref = torch.cuda.get_rng_state()
+        (expected * 128).backward()
+        gradients = {name: p.grad.detach().clone() for name, p in wrapped.named_parameters()
+                     if "lora_" in name and p.grad is not None}
+        reference_masks = list(masks)
+        masks.clear()
+        requests.clear()
+        ingress.clear()
+        wrapped.zero_grad(set_to_none=True)
+        torch.cuda.set_rng_state(initial)
+        monkeypatch.setenv("SOUP_FUSED_NORM_FP16", "1")
+        with torch.autocast("cuda", dtype=torch.float16):
+            for block in base.model.layers:
+                assert _input_norm_half_ready(block, base.model.embed_tokens(ids), {})
+            actual = wrapped(input_ids=ids, labels=labels, attention_mask=mask).loss
+        after_actual = torch.cuda.get_rng_state()
+        (actual * 128).backward()
+        assert torch.equal(after_ref, after_actual)
+        assert len(reference_masks) == len(masks) == 2 * len(base.model.layers)
+        for ref, got in zip(reference_masks, masks):
+            assert ref[:2] == got[:2] and got[1] == torch.float32
+            assert torch.equal(ref[2], got[2])
+        assert ingress and all(dtype == torch.float16 and ok for dtype, ok in ingress)
+        norm_ids = {id(block.input_layernorm.weight) for block in base.model.layers}
+        norm_ids.add(id(base.model.norm.weight))
+        assert all((key, torch.float16) in requests for key in norm_ids)
+        torch.testing.assert_close(actual, expected, rtol=5e-3, atol=3e-3)
+        for name, param in wrapped.named_parameters():
+            if name not in gradients:
+                continue
+            ref = gradients[name]
+            assert param.grad is not None and torch.isfinite(param.grad).all()
+            torch.testing.assert_close(param.grad, ref, rtol=3e-2, atol=5e-4, msg=name)
+            assert torch.linalg.vector_norm(param.grad - ref) <= 3e-2 * torch.linalg.vector_norm(ref) + 1e-6, name
+        # If LoRA cannot promise fp32 dropout, its input norm MUST stay full
+        # precision, so the original PEFT path never sees an unsafe half input.
+        first = base.model.layers[0]
+        rejected = first.self_attn.q_proj
+        monkeypatch.setattr(lora, "_eligible", lambda layer, x, kwargs, **opts:
+                            False if layer is rejected else eligibility(layer, x, kwargs, **opts))
+        requests.clear()
+        masks.clear()
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+            assert not _input_norm_half_ready(first, base.model.embed_tokens(ids), {})
+            wrapped(input_ids=ids, labels=labels, attention_mask=mask)
+        assert (id(first.input_layernorm.weight), None) in requests
+        assert all(dtype == torch.float32 for _, dtype, _ in masks)
+    finally:
+        for hook in hooks:
+            hook.remove()
 
 
 def test_empty_accuracy_and_distinct_masks(runtime):

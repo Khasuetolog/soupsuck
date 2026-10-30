@@ -9,10 +9,12 @@ The dynamic Rewind subclass resolves super().compute_loss on the patched TRL
 class, so no setup wrapper or dynamically generated class needs replacing.
 """
 
+from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
 from importlib.machinery import PathFinder
 import sys
+import os
 from types import ModuleType
 
 from .utils import (enabled, head_ineligibility, parallelism_ineligibility,
@@ -22,6 +24,100 @@ _DISABLE_HEAD = ContextVar("soup_fused_disable_head", default=False)
 _MODEL_STEP = "_solution_fused_step"
 _MARKER = "_solution_fused_original"
 _DIAGNOSTICS = set()
+_HALF_NORM = ContextVar("soup_half_norm_owner", default=None)
+
+
+@contextmanager
+def _half_norm_scope(norm):
+    """Select one explicitly owned norm, never all norms of the same class."""
+    token = _HALF_NORM.set(norm)
+    try:
+        yield
+    finally:
+        _HALF_NORM.reset(token)
+
+
+def _plain_half_consumer(module, x):
+    import torch
+
+    if (not isinstance(module, torch.nn.Module) or "forward" in module.__dict__
+            or module._forward_hooks or module._forward_pre_hooks
+            or module._backward_hooks or module._backward_pre_hooks):
+        return False
+    if type(module) is torch.nn.Linear:
+        return (torch.is_autocast_enabled("cuda") and torch.get_autocast_dtype("cuda") == torch.float16
+                and supported_tensor(module.weight) and module.weight.device == x.device)
+    return (type(module).__module__ == "bitsandbytes.nn.modules"
+            and type(module).__name__ == "Linear4bit" and module.compute_dtype == torch.float16
+            and module.compute_type_is_set and getattr(module.weight, "quant_state", None) is not None
+            and module.weight.device == x.device and not any(p.requires_grad for p in module.parameters()))
+
+
+def _half_norm_enabled(norm):
+    import torch
+
+    return (isinstance(norm, torch.nn.Module) and enabled() and os.environ.get("SOUP_FUSED_NORM_FP16") != "0"
+            and not (norm._forward_hooks or norm._forward_pre_hooks
+                     or norm._backward_hooks or norm._backward_pre_hooks))
+
+
+def _input_norm_half_ready(layer, x, kwargs):
+    """Qwen2Attention.forward:206-208 has exactly three normalized-input consumers."""
+    norm, attention = layer.input_layernorm, layer.self_attn
+    import torch
+
+    # Outside AMP, rotary cos/sin can promote q/k back to fp32 while v stays
+    # half; eager attention's subsequent fp32@fp16 matmul would be invalid.
+    # Require AMP for the entire attention, not only its input projections.
+    if (not torch.is_autocast_enabled("cuda") or torch.get_autocast_dtype("cuda") != torch.float16
+            or not _half_norm_enabled(norm) or not supported_tensor(x)
+            or type(attention).__module__ != _QWEN_MODULE or type(attention).__name__ != "Qwen2Attention"
+            or "forward" in attention.__dict__ or attention._forward_hooks or attention._forward_pre_hooks
+            or attention._backward_hooks or attention._backward_pre_hooks):
+        return False
+    if kwargs.get("output_hidden_states") or getattr(attention.config, "output_hidden_states", False):
+        return False
+    from .lora import fp16_ingress_ready
+
+    return all(_plain_half_consumer(proj, x) or fp16_ingress_ready(proj, x)
+               for proj in (attention.q_proj, attention.k_proj, attention.v_proj))
+
+
+def _final_norm_half_ready(model, kwargs):
+    """Scope Qwen2Model.norm only when the owning CausalLM consumes it as fp16."""
+    norm = getattr(model.model, "norm", None)
+    import torch
+
+    if (not torch.is_autocast_enabled("cuda") or torch.get_autocast_dtype("cuda") != torch.float16
+            or type(model.lm_head) is not torch.nn.Linear):
+        return False
+    if not _half_norm_enabled(norm) or not supported_tensor(norm.weight):
+        return False
+    if (model.model._forward_hooks or model.model._forward_pre_hooks
+            or model.model._backward_hooks or model.model._backward_pre_hooks):
+        return False
+    if kwargs.get("output_hidden_states") or getattr(model.config, "output_hidden_states", False):
+        return False
+    # Plain head under CUDA fp16 autocast, or the fused head that explicitly
+    # converts hidden to fp16 (cross_entropy.py:124). Model-only calls are not scoped.
+    return _plain_half_consumer(model.lm_head, norm.weight)
+
+
+def _post_norm_half_ready(layer, x):
+    """P1-2: never feed half norm output to fp32 dense MLP without autocast."""
+    import torch
+
+    norm, mlp = layer.post_attention_layernorm, layer.mlp
+    if (not _half_norm_enabled(norm) or not supported_tensor(x)
+            or type(mlp).__module__ != _QWEN_MODULE or type(mlp).__name__ != "Qwen2MLP"
+            or "forward" in mlp.__dict__ or mlp._forward_hooks or mlp._forward_pre_hooks
+            or mlp._backward_hooks or mlp._backward_pre_hooks):
+        return False
+    if torch.is_autocast_enabled("cuda") and torch.get_autocast_dtype("cuda") != torch.float16:
+        return False
+    projections = (mlp.gate_proj, mlp.up_proj, mlp.down_proj)
+    return len({type(proj) for proj in projections}) == 1 and all(
+        _plain_half_consumer(proj, x) for proj in projections)
 
 
 def _report_head(reason=None):
@@ -89,8 +185,12 @@ def _patch_head(cls):
         if reason is not None:
             if self.training:
                 _report_head(f"head: {reason}")
-            return original(self, labels=labels, logits_to_keep=logits_to_keep, **arguments)
-        outputs = self.model(**arguments)
+            norm = self.model.norm if type(self) is cls and _final_norm_half_ready(self, kwargs) else None
+            with _half_norm_scope(norm):
+                return original(self, labels=labels, logits_to_keep=logits_to_keep, **arguments)
+        norm = self.model.norm if _final_norm_half_ready(self, kwargs) else None
+        with _half_norm_scope(norm):
+            outputs = self.model(**arguments)
         hidden = outputs.last_hidden_state
         # Unsupported decoder layouts still use its already-computed result.
         reason = tensor_ineligibility(hidden, "hidden")
@@ -134,7 +234,10 @@ def _patch_norm(cls):
                 and hidden_states.shape[-1] == self.weight.numel()):
             from .kernels.rmsnorm import rms_norm
 
-            return rms_norm(hidden_states, self.weight, self.variance_epsilon)
+            import torch
+
+            out_dtype = torch.float16 if _HALF_NORM.get() is self and _half_norm_enabled(self) else None
+            return rms_norm(hidden_states, self.weight, self.variance_epsilon, out_dtype=out_dtype)
         return original(self, hidden_states)
 
     cls.forward = _mark(forward, original)
@@ -256,7 +359,8 @@ def _patch_lazy_mlp(cls):
 _QWEN_MODULE = "transformers.models.qwen2.modeling_qwen2"
 _TRL_MODULE = "trl.trainer.sft_trainer"
 _BNB_MODULE = "peft.tuners.lora.bnb"
-_TARGET_MODULES = {_QWEN_MODULE, _TRL_MODULE, _BNB_MODULE}
+_NF4_MODULES = {"bitsandbytes", "bitsandbytes.functional", "bitsandbytes.backends.cuda.ops"}
+_TARGET_MODULES = {_QWEN_MODULE, _TRL_MODULE, _BNB_MODULE, *_NF4_MODULES}
 _IMPORT_FINDER = None
 
 
@@ -295,6 +399,23 @@ def _register_module(name, module):
             from .lora import _patch_class
 
             _patch_class(cls, tuple(module.VARIANT_KWARG_KEYS))
+    elif name in _NF4_MODULES:
+        loaded = {key: sys.modules.get(key) for key in _NF4_MODULES}
+        if not all(isinstance(value, ModuleType) for value in loaded.values()):
+            return
+        # bnb's functional/backend imports can be circular. Never import the
+        # other half early, or patch a module still executing. The currently
+        # executing loader callback runs AFTER its underlying exec_module.
+        if any(key != name and getattr(getattr(value, "__spec__", None), "_initializing", False)
+               for key, value in loaded.items()):
+            return
+        functional, backend = loaded["bitsandbytes.functional"], loaded["bitsandbytes.backends.cuda.ops"]
+        if not (callable(getattr(functional, "dequantize_4bit", None))
+                and callable(getattr(backend, "_dequantize_4bit_impl", None))):
+            return
+        from .nf4_patch import patch_bnb_dequant
+
+        patch_bnb_dequant()
 
 
 class _PatchLoader:

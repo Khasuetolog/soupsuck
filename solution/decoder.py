@@ -7,8 +7,9 @@ residual add intact. Fusing that last add with the NEXT layer's input norm
 would require replacing the model loop or passing hidden state across layers,
 changing hooks/hidden-state observability and the final norm boundary.
 
-The post-attention norm output feeds only the MLP (no LoRA, no dropout), whose
-frozen 4-bit projections compute in fp16 anyway, so by default the kernel
+The post-attention norm output feeds only the MLP (no LoRA, no dropout). When
+all its projections accept fp16 (CUDA fp16 autocast, or frozen bnb fp16
+compute), by default the kernel
 writes round_fp16 of the exact fp32 norm output: the same values the
 projections consume, at half the activation memory. On a Kaggle T4 this cut
 the peak from 8003 to 5843 MiB with the same eval loss. SOUP_FUSED_NORM_FP16=0
@@ -21,7 +22,6 @@ consumer would otherwise autocast that tensor. Profile counts need measurement.
 
 from functools import wraps
 import importlib
-import os
 from types import ModuleType
 
 from .utils import enabled, supported_tensor
@@ -59,7 +59,13 @@ def patch_qwen2_decoder():
                             position_ids=position_ids, past_key_values=past_key_values,
                             use_cache=use_cache, position_embeddings=position_embeddings, **kwargs)
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        # Explicit ownership scopes distinguish this norm from post-attention
+        # and final norms without tagging instances or guessing module names.
+        from .patch import _half_norm_scope, _input_norm_half_ready, _post_norm_half_ready
+
+        norm = self.input_layernorm if _input_norm_half_ready(self, hidden_states, kwargs) else None
+        with _half_norm_scope(norm):
+            hidden_states = self.input_layernorm(hidden_states)
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states, attention_mask=attention_mask,
             position_ids=position_ids, past_key_values=past_key_values,
@@ -73,7 +79,7 @@ def patch_qwen2_decoder():
                 and not norm._backward_hooks and not norm._backward_pre_hooks):
             from .kernels.add_rmsnorm import add_rms_norm
 
-            output_dtype = None if os.environ.get("SOUP_FUSED_NORM_FP16") == "0" else torch.float16
+            output_dtype = torch.float16 if _post_norm_half_ready(self, residual) else None
             residual, hidden_states = add_rms_norm(
                 residual, hidden_states, norm.weight, norm.variance_epsilon, output_dtype)
         else:
