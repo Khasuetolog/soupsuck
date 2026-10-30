@@ -89,6 +89,72 @@ def test_start_is_literal_opt_in_and_idempotent(monkeypatch):
     assert sorted(called) == ['compile', 'pinned']
 
 
+def test_process_requires_run_cache_and_uses_spawn_inherited_env(monkeypatch, tmp_path):
+    import solution.precompile as prep
+    import multiprocessing
+
+    monkeypatch.setattr(prep, '_STATE', dict(started=False, compiled=0, pinned_pairs=0,
+                                          errors=[], finished=[]))
+    monkeypatch.setattr(prep, '_THREADS', [])
+    monkeypatch.setattr(prep, '_PROCESS', None)
+    monkeypatch.setattr(prep, '_PROCESS_RESULT', None)
+    monkeypatch.setenv('SOUP_EXP_PRECOMPILE', 'process')
+    monkeypatch.delenv('TRITON_CACHE_DIR', raising=False)
+    assert not prep.start()
+    assert 'TRITON_CACHE_DIR' in prep.status()['errors'][0]
+    seen = []
+    class End:
+        def close(self):
+            seen.append('closed')
+        def poll(self):
+            return False
+    class Process:
+        def __init__(self, **kwargs):
+            seen.append(kwargs)
+            self.pid, self.exitcode, self.name = 42, None, kwargs['name']
+        def start(self):
+            seen.append(dict(TRITON_CACHE_DIR=__import__('os').environ['TRITON_CACHE_DIR']))
+        def is_alive(self):
+            return False
+        def join(self, timeout=None):
+            return None
+    def context(method):
+        assert method == 'spawn'
+        return SimpleNamespace(Pipe=lambda duplex: (End(), End()), Process=Process)
+    monkeypatch.setattr(multiprocessing, 'get_context', context)
+    monkeypatch.setattr(prep, '_pinned', lambda: None)
+    cache_dir = str(tmp_path / 'this-run' / 'triton_cache')
+    monkeypatch.setenv('TRITON_CACHE_DIR', cache_dir)
+    assert prep.start()
+    assert not prep.start()
+    prep.wait(5)
+    spec = next(v for v in seen if isinstance(v, dict) and 'target' in v)
+    assert spec['target'] is prep._process_compile and spec['daemon'] is False
+    assert spec['args'][1] == cache_dir
+    assert dict(TRITON_CACHE_DIR=cache_dir) in seen
+    assert not Path(cache_dir).exists()  # start never creates or substitutes a cache
+
+
+def test_process_child_failure_report_is_bounded_and_checks_cache_identity(monkeypatch):
+    import pickle
+    import solution.precompile as prep
+
+    messages = []
+    send = SimpleNamespace(send=messages.append, close=lambda: None)
+    monkeypatch.setenv('TRITON_CACHE_DIR', '/run/current/triton_cache')
+    def forbidden():
+        raise AssertionError('must reject a different cache before compilation')
+    monkeypatch.setattr(prep, '_offline_compile', forbidden)
+    with pytest.raises(SystemExit):
+        prep._process_compile(send, '/run/another/triton_cache')
+    assert 'exact run TRITON_CACHE_DIR' in messages[-1]['errors'][0]
+    monkeypatch.setattr(prep, '_offline_compile', lambda: dict(
+        compiled=0, errors=['failure ' + 'x'*10000] * 62, cuda_initialized=False))
+    with pytest.raises(SystemExit):
+        prep._process_compile(send, '/run/current/triton_cache')
+    assert len(pickle.dumps(messages[-1])) < 4096
+
+
 def test_pinned_pairs_are_consumed_once_with_original_shape_policy(monkeypatch):
     import solution
     import solution.precompile as prep
@@ -125,7 +191,8 @@ def test_pinned_pairs_are_consumed_once_with_original_shape_policy(monkeypatch):
     assert fake._HostSlot(4096, 1000).gate.shape == (4096, 1000)
 
 
-def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch):
+@pytest.mark.parametrize('mode', ['1', 'process'], ids=['thread', 'spawn-disk-cache'])
+def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch, tmp_path, mode):
     torch = pytest.importorskip('torch')
     if not torch.cuda.is_available():
         pytest.skip('CUDA required')
@@ -141,21 +208,50 @@ def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch):
     from solution.kernels.nf4 import dequantize_nf4, _dequantize_flat_into
     from solution.kernels.rope import fused_rope
 
-    monkeypatch.setenv('SOUP_EXP_PRECOMPILE', '1')
+    monkeypatch.setenv('SOUP_EXP_PRECOMPILE', mode)
     monkeypatch.setenv('SOUP_MLP_OFFLOAD', '0')
     monkeypatch.setattr(prep, '_STATE', dict(started=False, compiled=0, pinned_pairs=0,
                                           errors=[], finished=[]))
     monkeypatch.setattr(prep, '_THREADS', [])
+    monkeypatch.setattr(prep, '_PROCESS', None)
+    monkeypatch.setattr(prep, '_PROCESS_RESULT', None)
+    device = torch.cuda.current_device()
+    kernels = {p.kernel: getattr(importlib.import_module(p.module), p.kernel) for p in prep.plans()}
+    if mode == 'process':
+        assert torch.cuda.get_device_capability() == (7, 5), 'offline target is sm75 (T4)'
+        cache_dir = tmp_path / 'this-test-run' / 'triton_cache'
+        assert not cache_dir.exists()
+        monkeypatch.setenv('TRITON_CACHE_DIR', str(cache_dir))
+        # Triton env knobs may have been materialized by preceding tests.
+        monkeypatch.setattr(triton.knobs.cache, 'dir', str(cache_dir))
+        for kernel in kernels.values():
+            kernel.device_caches[device][0].clear()
     assert prep.start()
     state = prep.wait(180)
     assert not state['alive'] and not state['errors'], state
     assert state['compiled'] == len(prep.plans())
-    device = torch.cuda.current_device()
-    kernels = {p.kernel: getattr(importlib.import_module(p.module), p.kernel) for p in prep.plans()}
+    if mode == 'process':
+        assert state['process_exitcode'] == 0, state
+        assert state['child_cuda_initialized'] is False, state
+        assert state['child_driver_touched'] is False, state
     seen = set()
+    disk_hits, compilation_misses = set(), []
     active = [True]
     touched = set()
     case_name = ['']
+    previous_listener = triton.knobs.compilation.listener
+    def compilation_listener(**event):
+        if active[0] and mode == 'process':
+            name = event['src'].name
+            if name in kernels:
+                if event['cache_hit']:
+                    disk_hits.add(name)
+                else:
+                    compilation_misses.append((case_name[0], name))
+                assert event['cache_hit'], f'actual compiler miss: {case_name[0]} / {name}'
+        if previous_listener is not None:
+            previous_listener(**event)
+    monkeypatch.setattr(triton.knobs.compilation, 'listener', compilation_listener)
 
     def check_hook(name, kernel):
         def hook(*args, **kwargs):
@@ -166,7 +262,7 @@ def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch):
             key = compute_cache_key(key_cache, specialization, options)
             # Hook runs inside real JIT.run AFTER debug/instrumentation kwargs
             # are added, and BEFORE cache lookup. No hand-coded D/==1 guesses.
-            assert key in cache, (f'precompile missed {case_name[0]} / {name}: '
+            assert mode == 'process' or key in cache, (f'precompile missed {case_name[0]} / {name}: '
                                   f'specialization={specialization!r}, options={options!r}; '
                                   f'prepared_keys={tuple(cache)!r}')
             seen.add(name)
@@ -285,6 +381,9 @@ def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch):
             return nested, _dequantize_flat_into(packed, flat, out)
         compare(f'NF4/{shape}/nested+flat', nf4_run)
     assert seen == set(kernels)
+    if mode == 'process':
+        assert not compilation_misses
+        assert disk_hits == set(kernels), 'every kernel must load a child-built disk artifact'
 
 
 def test_prepared_pinned_storage_preserves_offload_outputs_and_gradients(monkeypatch):

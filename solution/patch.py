@@ -476,7 +476,7 @@ def install():
         module = sys.modules.get(name)
         if module is not None:
             _register_module(name, module)
-    if os.environ.get("SOUP_EXP_PRECOMPILE") == "1":
+    if os.environ.get("SOUP_EXP_PRECOMPILE") in ("1", "process"):
         from .precompile import start
 
         start()

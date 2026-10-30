@@ -1,4 +1,4 @@
-"""EXP-001: measured-run, opt-in preparation; never launch a CUDA kernel here.
+"""EXP-001/005: measured-run, opt-in preparation; no CUDA kernel launches.
 
 Triton 3.6 runtime/jit.py:695-736 obtains the current CUDA device/stream even
 for warmup. Thus this DOES initialize CUDA, on a background thread, before
@@ -19,6 +19,14 @@ streams, events and lifetime policy. Only unconsumed host reservations remain
 here; no staging CUDA tensors are preallocated and no DMA is submitted.
 Errors disable only the failed preparation operation and are reported; actual
 training/kernel errors still propagate from the unchanged production path.
+
+SOUP_EXP_PRECOMPILE=process uses a fresh multiprocessing spawn child and an
+explicit sm75 target. It builds ASTSource via Triton's native argument binder
+and _pack_args, then compiles into the INHERITED run TRITON_CACHE_DIR. No child
+CUDA context, warmup/launch, tensors, pinned buffers or device cache are used.
+The parent loads these binaries normally on first use. No cache directory is
+created outside the measured run or carried between runs. Non-daemon children
+are joined by multiprocessing at normal parent exit, so their time counts.
 """
 
 from dataclasses import dataclass
@@ -157,6 +165,8 @@ def plans():
 
 _LOCK = threading.RLock()
 _THREADS = []
+_PROCESS = None
+_PROCESS_RESULT = None
 _STATE = dict(started=False, compiled=0, pinned_pairs=0, errors=[], finished=[])
 _PINNED = []
 
@@ -164,14 +174,20 @@ _PINNED = []
 def status():
     """JSON-friendly diagnostics; no synchronization with the GPU."""
     with _LOCK:
+        _collect_process()
         return {**_STATE, 'errors': list(_STATE['errors']),
                 'finished': list(_STATE['finished']),
-                'alive': [t.name for t in _THREADS if t.is_alive()]}
+                'alive': [t.name for t in _THREADS if t.is_alive()]
+                         + ([_PROCESS.name] if _PROCESS is not None and _PROCESS.is_alive() else []),
+                'process_pid': _PROCESS.pid if _PROCESS is not None else None,
+                'process_exitcode': _PROCESS.exitcode if _PROCESS is not None else None}
 
 
 def wait(timeout=None):
     """Testing/diagnostics only; install and training never wait for preparation."""
     deadline = None if timeout is None else time.monotonic() + timeout
+    if _PROCESS is not None:
+        _PROCESS.join(None if deadline is None else max(0, deadline-time.monotonic()))
     for thread in list(_THREADS):
         thread.join(None if deadline is None else max(0, deadline-time.monotonic()))
     return status()
@@ -194,6 +210,100 @@ def warmup_plan(plan):
                       if isinstance(a, str) and a.startswith('*') else a
                       for a in plan.args)
     return kernel.warmup(*arguments, grid=(1,), **plan.options)
+
+
+def _offline_compile():
+    """Compile the SAME native specializations for sm75, without driver.active.
+
+    Use explicit backend + create_function_from_signature instead of
+    JITFunction.create_binder (which queries the active CUDA device).
+    _pack_args and triton.compile are the same methods used by real JIT.run.
+    CompiledKernel handles are lazy; never access .run/.function here.
+    """
+    import torch
+    import triton
+    from triton import knobs
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler.compiler import ASTSource, make_backend
+    from triton.runtime.jit import MockTensor, create_function_from_signature
+    from triton.runtime.driver import driver
+
+    if not triton.__version__.startswith('3.6.'):
+        raise RuntimeError('Process preparation supports Triton 3.6.x only')
+    target = GPUTarget('cuda', 75, 32)
+    backend = make_backend(target)
+    prepared, errors = 0, []
+    for plan in plans():
+        try:
+            kernel = getattr(importlib.import_module(plan.module), plan.kernel)
+            args = tuple(MockTensor(getattr(torch, a[1:]))
+                         if isinstance(a, str) and a.startswith('*') else a for a in plan.args)
+            kwargs = dict(plan.options)
+            kwargs['debug'] = kwargs.get('debug', kernel.debug) or knobs.runtime.debug
+            kwargs['instrumentation_mode'] = knobs.compilation.instrumentation_mode
+            binder = create_function_from_signature(kernel.signature, kernel.params, backend)
+            bound, specialization, options = binder(*args, **kwargs)
+            options, signature, constants, attrs = kernel._pack_args(
+                backend, kwargs, bound, specialization, options)
+            triton.compile(ASTSource(kernel, signature, constants, attrs),
+                           target=target, options=options.__dict__)
+            prepared += 1
+        except Exception as exc:
+            errors.append(f'{plan.kernel}: {type(exc).__name__}: {exc}')
+    initialized = torch.cuda.is_initialized()  # flag read; does not initialize CUDA
+    driver_touched = driver._active is not None or driver._default is not None
+    if initialized:
+        errors.append('Offline compiler unexpectedly initialized torch CUDA')
+    if driver_touched:
+        errors.append('Offline compiler unexpectedly accessed an active Triton driver')
+    return dict(compiled=prepared, errors=errors, cuda_initialized=initialized,
+                driver_touched=driver_touched)
+
+
+def _process_compile(send, cache_dir):
+    """Spawn entrypoint; only inherits this measured run's cache environment."""
+    result = dict(compiled=0, errors=[], cuda_initialized=False)
+    try:
+        if not cache_dir or os.environ.get('TRITON_CACHE_DIR') != cache_dir:
+            raise RuntimeError('Child must inherit the exact run TRITON_CACHE_DIR')
+        result = _offline_compile()
+    except Exception as exc:
+        result['errors'].append(f'{type(exc).__name__}: {exc}')
+    finally:
+        # Parent never has to poll during training. Keep the single IPC packet
+        # below PIPE_BUF so even failure cannot block child exit/parent atexit
+        # join on a full pipe; full diagnostics go to the inherited train log.
+        for error in result['errors']:
+            print('[solution] EXP-005 compiler child: ' + error, file=sys.stderr, flush=True)
+        errors = result['errors']
+        result['errors'] = [e[:512] for e in errors[:4]]
+        if len(errors) > 4:
+            result['errors'].append(f'{len(errors)-4} additional errors; see inherited stderr')
+        send.send(result)
+        send.close()
+    if result['errors']:
+        raise SystemExit(1)
+
+
+def _collect_process():
+    """Nonblocking result transfer; caller holds _LOCK."""
+    global _PROCESS_RESULT
+    if _PROCESS_RESULT is None:
+        return
+    if _PROCESS_RESULT.poll():
+        try:
+            result = _PROCESS_RESULT.recv()
+        except EOFError:
+            result = dict(compiled=0, errors=['Compiler child exited without a result'])
+        _PROCESS_RESULT.close()
+        _PROCESS_RESULT = None
+        _STATE['compiled'] = result['compiled']
+        _STATE['child_cuda_initialized'] = result.get('cuda_initialized')
+        _STATE['child_driver_touched'] = result.get('driver_touched')
+        _STATE['errors'].extend(result['errors'])
+        _STATE['finished'].append('compile-process')
+        for message in result['errors']:
+            print('[solution] EXP-005 preparation failed: ' + message, file=sys.stderr, flush=True)
 
 
 def _compile():
@@ -255,14 +365,36 @@ def _run(name, function):
 
 
 def start():
-    """Start once only for literal SOUP_EXP_PRECOMPILE=1; no default imports."""
-    if os.environ.get('SOUP_EXP_PRECOMPILE') != '1':
+    """Start once for 1 (thread) or process (spawn); default remains cold."""
+    global _PROCESS, _PROCESS_RESULT
+    mode = os.environ.get('SOUP_EXP_PRECOMPILE')
+    if mode not in ('1', 'process'):
         return False
     with _LOCK:
         if _STATE['started']:
             return False
+        if mode == 'process' and not os.environ.get('TRITON_CACHE_DIR'):
+            _error('process', RuntimeError('Explicit run TRITON_CACHE_DIR is required'))
+            return False
         _STATE['started'] = True
-        for name, fn in (('compile', _compile), ('pinned', _pinned)):
+        if mode == 'process':
+            import multiprocessing
+
+            context = multiprocessing.get_context('spawn')
+            receive, send = context.Pipe(duplex=False)
+            process = context.Process(target=_process_compile,
+                args=(send, os.environ['TRITON_CACHE_DIR']), name='soup-precompile-process', daemon=False)
+            try:
+                process.start()
+            except Exception:
+                receive.close()
+                send.close()
+                _STATE['started'] = False
+                raise
+            send.close()
+            _PROCESS, _PROCESS_RESULT = process, receive
+        jobs = (('compile', _compile), ('pinned', _pinned)) if mode == '1' else (('pinned', _pinned),)
+        for name, fn in jobs:
             thread = threading.Thread(target=_run, args=(name, fn),
                                       name='soup-precompile-' + name, daemon=True)
             _THREADS.append(thread)
