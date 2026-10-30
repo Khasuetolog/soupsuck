@@ -3,9 +3,100 @@
 from collections import defaultdict
 import copy
 import sys
-from types import SimpleNamespace
+import importlib
+from pathlib import Path
+import subprocess
+from types import ModuleType, SimpleNamespace
 
 import pytest
+
+
+def test_cold_apply_does_not_import_training_dependencies():
+    code = """
+import sys
+import solution
+solution.apply()
+solution.apply()
+assert not any(name in sys.modules for name in
+               ('torch', 'triton', 'transformers', 'trl', 'peft', 'soup_cli'))
+"""
+    subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[2], check=True)
+
+
+def test_import_hook_patches_before_import_returns(monkeypatch, tmp_path):
+    import solution.patch as patch
+
+    name = "solution_lazy_fixture"
+    (tmp_path / f"{name}.py").write_text("class Example:\n    value = 1\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(patch, "_TARGET_MODULES", {name})
+    seen = []
+    def register(fullname, module):
+        if not getattr(module.Example, "patched", False):
+            module.Example.value = 2
+            module.Example.patched = True
+            seen.append(fullname)
+    monkeypatch.setattr(patch, "_register_module", register)
+    patch.install()
+    module = importlib.import_module(name)
+    try:
+        assert module.Example.value == 2 and seen == [name]
+        patch.install()
+        assert seen == [name]
+        importlib.reload(module)
+        assert module.Example.value == 2 and seen == [name, name]
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_lazy_mlp_registers_own_implementation_without_example(monkeypatch):
+    import solution.patch as patch
+
+    class MLP:
+        def forward(self, x):
+            return "original"
+    original = MLP.forward
+    fake = ModuleType("solution.mlp")
+    calls = []
+    def install_fused():
+        assert MLP.forward is original  # trampoline marker must not block it
+        def forward(self, x):
+            return "own-fused"
+        setattr(forward, patch._MARKER, original)
+        MLP.forward = forward
+        calls.append("own-fused")
+    fake.patch_qwen2_mlp_fused = install_fused
+    monkeypatch.setitem(sys.modules, "solution.mlp", fake)
+    before = sys.modules.get("solution.swiglu")
+    patch._patch_lazy_mlp(MLP)
+    trampoline = MLP.forward
+    patch._patch_lazy_mlp(MLP)
+    assert MLP.forward is trampoline
+    assert MLP().forward(SimpleNamespace(is_cuda=False)) == "original"
+    assert MLP().forward(SimpleNamespace(is_cuda=True)) == "own-fused"
+    patch._patch_lazy_mlp(MLP)
+    assert MLP().forward(SimpleNamespace(is_cuda=True)) == "own-fused"
+    assert calls == ["own-fused"] and sys.modules.get("solution.swiglu") is before
+
+
+def test_trl_import_callback_finds_hf_trainer_through_base_trainer(monkeypatch):
+    import solution.patch as patch
+
+    trainer = type("Trainer", (), {"__module__": "transformers.trainer"})
+    base = type("BaseTrainer", (trainer,), {"__module__": "trl.trainer.base_trainer"})
+    def original(*args, **kwargs):
+        return "original"
+    cls = type("SFTTrainer", (base,), {"__module__": patch._TRL_MODULE, "compute_loss": original})
+    root = ModuleType("trl")
+    root.__path__ = []
+    module = ModuleType(patch._TRL_MODULE)
+    module.SFTTrainer, module.BaseTrainer = cls, base
+    monkeypatch.setitem(sys.modules, "trl", root)
+    patch._register_module(patch._TRL_MODULE, module)
+    patched = cls.compute_loss
+    assert getattr(patched, patch._MARKER) is original
+    patch._register_module(patch._TRL_MODULE, module)
+    assert cls.compute_loss is patched
 
 
 def test_apply_with_fake_modules(monkeypatch):
@@ -228,10 +319,17 @@ def test_accelerate_peft_forward_enables_amp_after_trainer_preflight(runtime, mo
     base = _model(torch, qwen)
     base.config.tie_word_embeddings = True
     base.tie_weights()
-    wrapped = peft.get_peft_model(base, peft.LoraConfig(
+    config = peft.LoraConfig(
         task_type="CAUSAL_LM", r=4, lora_alpha=8, lora_dropout=0.0,
         target_modules=["q_proj", "v_proj"],
-    ))
+    )
+    # PEFT model.py:382-400 puts custom mappings before optional quantizer
+    # dispatchers (including the incompatible package preinstalled on Kaggle).
+    # This changes only this test's config, without importing that package or
+    # modifying any global availability probe.
+    from peft.tuners.lora.layer import Linear
+    config._register_custom_module({torch.nn.Linear: Linear})
+    wrapped = peft.get_peft_model(base, config)
     accelerator = Accelerator(mixed_precision="fp16")
     prepared = accelerator.prepare_model(wrapped)
     assert qwen_model(prepared, qwen.Qwen2ForCausalLM) is base

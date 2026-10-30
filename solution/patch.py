@@ -11,7 +11,7 @@ class, so no setup wrapper or dynamically generated class needs replacing.
 
 from contextvars import ContextVar
 from functools import wraps
-import importlib
+from importlib.machinery import PathFinder
 import sys
 from types import ModuleType
 
@@ -56,14 +56,6 @@ def _bridge_ineligibility(trainer, qwen, inputs):
     # Trainer is outside Accelerate's model.forward autocast boundary. Only
     # structural conditions belong here; forward rechecks actual precision.
     return head_ineligibility(qwen, _check_precision=False, **inputs)
-
-
-def _package(name):
-    try:
-        module = importlib.import_module(name)
-    except ImportError:
-        return None
-    return module if isinstance(module, ModuleType) and hasattr(module, "__path__") else None
 
 
 def _mark(wrapper, original):
@@ -201,7 +193,13 @@ def _patch_trainer(cls, qwen_cls, trainer_cls, step_attr):
     @wraps(original)
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         setattr(self, step_attr, None)
-        qwen = qwen_model(model, qwen_cls)
+        # TRL can load before Qwen2; do not import the architecture just to
+        # register its trainer bridge. It exists by the first model forward.
+        actual_cls = qwen_cls
+        if actual_cls is None:
+            module = sys.modules.get("transformers.models.qwen2.modeling_qwen2")
+            actual_cls = getattr(module, "Qwen2ForCausalLM", None)
+        qwen = qwen_model(model, actual_cls)
         if qwen is not None:
             setattr(qwen, _MODEL_STEP, None)
         reason = _bridge_ineligibility(self, qwen, inputs)
@@ -232,35 +230,112 @@ def _patch_trainer(cls, qwen_cls, trainer_cls, step_attr):
     cls.compute_loss = _mark(compute_loss, original)
 
 
-def install():
-    # Fake SimpleNamespaces in Soup tests may lack __spec__ and package paths.
-    if _package("transformers") is None:
+def _patch_lazy_mlp(cls):
+    """Load the own fused MLP on first CUDA use; never register the example."""
+    original = cls.forward
+    if hasattr(original, _MARKER):
         return
-    try:
-        from transformers.models.qwen2 import modeling_qwen2 as qwen
-        from transformers import Trainer
-        from trl import SFTTrainer
-        from soup_cli.utils.stream_loss_chunk import STEP_ATTR
-    except (ImportError, AttributeError):
-        return
-    if not all(isinstance(c, type) for c in
-               (qwen.Qwen2ForCausalLM, qwen.Qwen2RMSNorm, SFTTrainer, Trainer)):
-        return
-    _patch_trainer(SFTTrainer, qwen.Qwen2ForCausalLM, Trainer, STEP_ATTR)
-    _patch_head(qwen.Qwen2ForCausalLM)
-    _patch_norm(qwen.Qwen2RMSNorm)
-    from .decoder import patch_qwen2_decoder
-    from .lora import patch_lora_4bit
 
-    patch_qwen2_decoder()
-    patch_lora_4bit()
-    # Preserve the supplied example, guarding its registration externally.
-    mlp = qwen.Qwen2MLP
-    if not hasattr(mlp.forward, _MARKER):
-        try:
-            from .swiglu import patch_qwen2_mlp
-        except ImportError:
-            return  # e.g. CPU-only torch without Triton
-        original = mlp.forward
-        patch_qwen2_mlp()
-        _mark(mlp.forward, original)
+    @wraps(original)
+    def forward(self, x):
+        if not x.is_cuda or not enabled() or type(self) is not cls:
+            return original(self, x)
+        from .mlp import patch_qwen2_mlp_fused
+
+        # Both patches use _MARKER. Restore the original before asking the
+        # own MLP installer to register, otherwise it would see our trampoline
+        # marker and incorrectly treat the implementation as already installed.
+        if cls.forward is forward:
+            cls.forward = original
+            patch_qwen2_mlp_fused()
+        return cls.forward(self, x)
+
+    cls.forward = _mark(forward, original)
+
+
+_QWEN_MODULE = "transformers.models.qwen2.modeling_qwen2"
+_TRL_MODULE = "trl.trainer.sft_trainer"
+_BNB_MODULE = "peft.tuners.lora.bnb"
+_TARGET_MODULES = {_QWEN_MODULE, _TRL_MODULE, _BNB_MODULE}
+_IMPORT_FINDER = None
+
+
+def _register_module(name, module):
+    # Fake regression-test modules need not be packages or expose real types.
+    root = sys.modules.get(name.split(".")[0])
+    if (not isinstance(module, ModuleType) or not isinstance(root, ModuleType)
+            or not hasattr(root, "__path__")):
+        return
+    if name == _QWEN_MODULE:
+        names = ("Qwen2ForCausalLM", "Qwen2RMSNorm", "Qwen2MLP", "Qwen2DecoderLayer")
+        if not all(isinstance(getattr(module, key, None), type)
+                   and getattr(module, key).__module__ == name for key in names):
+            return
+        _patch_head(module.Qwen2ForCausalLM)
+        _patch_norm(module.Qwen2RMSNorm)
+        from .decoder import patch_qwen2_decoder
+
+        patch_qwen2_decoder()
+        _patch_lazy_mlp(module.Qwen2MLP)
+    elif name == _TRL_MODULE:
+        cls = getattr(module, "SFTTrainer", None)
+        # TRL 0.29.1 imports BaseTrainer, not Trainer into this module.
+        # Resolve the actual HF base from MRO without another eager import.
+        trainer = next((base for base in cls.__mro__[1:]
+                        if base.__module__ == "transformers.trainer" and base.__name__ == "Trainer"),
+                       None) if isinstance(cls, type) else None
+        if isinstance(cls, type) and isinstance(trainer, type) and cls.__module__ == name:
+            # Pinned Soup stream_loss_chunk.py:298; importing that module at
+            # registration time is unnecessary. fused_head imports ChunkedStep
+            # only when training actually uses the no-logits head.
+            _patch_trainer(cls, None, trainer, "_soup_chunked_step")
+    elif name == _BNB_MODULE:
+        cls = getattr(module, "Linear4bit", None)
+        if isinstance(cls, type) and cls.__module__ == name:
+            from .lora import _patch_class
+
+            _patch_class(cls, tuple(module.VARIANT_KWARG_KEYS))
+
+
+class _PatchLoader:
+    def __init__(self, loader, name):
+        self.loader, self.name = loader, name
+
+    def create_module(self, spec):
+        create = getattr(self.loader, "create_module", None)
+        return create(spec) if create is not None else None
+
+    def exec_module(self, module):
+        self.loader.exec_module(module)
+        _register_module(self.name, module)
+
+    def __getattr__(self, name):
+        return getattr(self.loader, name)
+
+
+class _PatchFinder:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname not in _TARGET_MODULES:
+            return None
+        spec = PathFinder.find_spec(fullname, path, target)
+        if spec is not None and hasattr(spec.loader, "exec_module"):
+            spec.loader = _PatchLoader(spec.loader, fullname)
+        return spec
+
+
+def install():
+    """Register targeted post-import patches, without importing heavy packages.
+
+    Python calls exec_module before returning the imported module to its caller;
+    dynamic Soup subclasses therefore see patched TRL methods. Modules imported
+    before apply are handled immediately; markers keep both paths idempotent.
+    No CUDA kernel is imported or compiled here.
+    """
+    global _IMPORT_FINDER
+    if _IMPORT_FINDER is None:
+        _IMPORT_FINDER = _PatchFinder()
+        sys.meta_path.insert(0, _IMPORT_FINDER)
+    for name in _TARGET_MODULES:
+        module = sys.modules.get(name)
+        if module is not None:
+            _register_module(name, module)

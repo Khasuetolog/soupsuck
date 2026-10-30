@@ -65,7 +65,7 @@ ZIP проверяется на пути авторизации `.kaggle`, `kagg
 ZIP и автоматическая распаковка Kaggle. При несовпадении SHA/хешей обучение не
 начнётся; это также защищает от запуска старой версии dataset после нового HEAD.
 
-Во всех режимах сначала выполняются `task/prepare_data.py` и
+В режимах обучения сначала выполняются `task/prepare_data.py` и
 `python -m pytest solution -q -rs`. Затем:
 
 | Режим | Команды |
@@ -74,6 +74,33 @@ ZIP и автоматическая распаковка Kaggle. При несо
 | `solution` | `python harness/run_task.py --only solution --out runs_try --profile` |
 | `full` | `python harness/run_task.py`, `python harness/check_rules.py`, `python harness/score.py runs/result.json` |
 | `full2` | те же команды, но `run_task.py --repeats 2` |
+| `probe` | import-time диагностика apply/Soup и отдельные cold/warm вызовы ядер; без подготовки данных и обучения |
+
+Для диагностики старта после принятия/коммита изменений и `push-code`:
+
+```bash
+python3 tools/kaggle/run.py run --mode probe --tag startup
+```
+
+`probe_import_apply.log` и `probe_import_baseline.log` содержат вывод
+`python -X importtime`: оба процесса импортируют torch, инициализируют CUDA и
+импортируют transformers, затем выполняют одинаковые импорты Soup/TRL/Qwen до
+построения модели. Первый процесс перед этим вызывает `solution.apply()` и
+печатает `apply_s`, оба печатают `soup_pre_model_s`. Поэтому виден и перенос
+стоимости импорта между этапами; уменьшение apply_s само по себе не доказывает
+уменьшение полного wall time.
+
+[`probe.py`](probe.py) запускается отдельным процессом и пишет
+`probe_compile.log` и `probe_compile.json`: перехватывает вызовы Triton compiler
+API с CPU-временем компиляции каждого имени/варианта; отдельно измеряет cold и
+warm wall time вызовов, включая GEMM/launch/backward. Формы: N=2048, H=1536,
+V=151936, MLP I=8960. Пробуются CE, RMSNorm, add+RMSNorm, tiled SwiGLU, исходный
+SwiGLU-пример и LoRA-эпилог, включая fp16/fp32 и optional norm-weight gradients.
+Сумма compile time включает эти дополнительные варианты и не равна напрямую
+стоимости компиляции конкретного training run. JSON хранит разбиение по case.
+Используется новый временный `TRITON_CACHE_DIR`, удаляемый при выходе; этот кэш
+и compiler instrumentation не передаются в harness. Прогон последовательный.
+Ошибки сохраняются в JSON/status и возвращают ненулевой код.
 
 Все команды исполняются последовательно, дополнительная GPU-работа не
 запускается. Коды возврата сохраняются в `/kaggle/working/out/status.json`;
