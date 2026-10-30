@@ -20,6 +20,35 @@ def test_apply_with_fake_modules(monkeypatch):
     assert sys.modules["transformers"] is fake
 
 
+def test_head_diagnostics_are_once_per_process(monkeypatch, capsys):
+    import solution.patch as patch
+
+    monkeypatch.setattr(patch, "_DIAGNOSTICS", set())
+    patch._report_head("bridge: trainer.compute_loss_func is configured")
+    patch._report_head("head: another refusal")
+    patch._report_head()
+    patch._report_head()
+    assert capsys.readouterr().err.splitlines() == [
+        "[solution] fused head disabled: bridge: trainer.compute_loss_func is configured",
+        "[solution] fused head active",
+    ]
+
+
+@pytest.mark.parametrize("axis", [None, "dp_replicate_size", "dp_shard_size", "tp_size", "cp_size", "sp_size"])
+def test_parallelism_guard_checks_active_sizes(axis):
+    from solution.utils import parallelism_ineligibility
+
+    config = SimpleNamespace(dp_replicate_size=1, dp_shard_size=1, tp_size=1,
+                             cp_size=1, sp_size=1)
+    if axis:
+        setattr(config, axis, 2)
+        assert axis in parallelism_ineligibility(config)
+    else:
+        assert parallelism_ineligibility(config) is None
+        assert parallelism_ineligibility(None) is None
+    assert parallelism_ineligibility(SimpleNamespace()) is not None
+
+
 @pytest.fixture
 def runtime():
     torch = pytest.importorskip("torch")
@@ -179,6 +208,99 @@ def test_forward_fallbacks(runtime):
     assert getattr(model, _MODEL_STEP) is None
     cpu = _model(torch, qwen, "cpu")
     assert cpu(input_ids=ids.cpu(), labels=labels.cpu(), attention_mask=mask.cpu()).logits is not None
+
+
+def test_accelerate_peft_forward_enables_amp_after_trainer_preflight(runtime, monkeypatch, capsys):
+    """Regression: real Trainer is outside AMP; Accelerate wraps PEFT.forward.
+
+    transformers/trainer.py:2075-2080 uses a nullcontext, whereas
+    accelerate/accelerator.py:1818-1830 enters autocast inside model.forward.
+    Outer-autocast tests do not exercise this boundary.
+    """
+    torch, qwen, _, rewind_cls = runtime
+    peft = pytest.importorskip("peft")
+    from accelerate import Accelerator
+    from soup_cli.utils.stream_loss_chunk import STEP_ATTR
+    import solution.patch as patch
+    from solution.utils import head_ineligibility, qwen_model
+
+    monkeypatch.setattr(patch, "_DIAGNOSTICS", set())
+    base = _model(torch, qwen)
+    base.config.tie_word_embeddings = True
+    base.tie_weights()
+    wrapped = peft.get_peft_model(base, peft.LoraConfig(
+        task_type="CAUSAL_LM", r=4, lora_alpha=8, lora_dropout=0.0,
+        target_modules=["q_proj", "v_proj"],
+    ))
+    accelerator = Accelerator(mixed_precision="fp16")
+    prepared = accelerator.prepare_model(wrapped)
+    assert qwen_model(prepared, qwen.Qwen2ForCausalLM) is base
+    assert type(base) is qwen.Qwen2ForCausalLM
+    assert base.lm_head.weight is base.model.embed_tokens.weight
+    assert base.lm_head.weight.dtype == torch.float32 and not base.lm_head.weight.requires_grad
+    ids, labels, mask = _batch(torch)
+    assert not torch.is_autocast_enabled("cuda")
+    assert "autocast is disabled" in head_ineligibility(base, labels)
+    # Structural preflight must allow Accelerate to enter its forward context.
+    assert head_ineligibility(base, labels, _check_precision=False) is None
+    trainer = _trainer(rewind_cls, prepared)
+    trainer.accelerator = accelerator
+    records = []
+    def fail(exc):
+        raise AssertionError("Rewind failed") from exc
+    trainer._soup_rewind_state = SimpleNamespace(
+        failed=False, on_micro_batch=lambda **kw: records.append(kw), fail=fail,
+    )
+    trainer.state = SimpleNamespace(global_step=0)
+    def dense_head_must_not_run(module, inputs):
+        raise AssertionError("Dense lm_head ran; the fused head was not activated")
+    hook = base.lm_head.register_forward_pre_hook(dense_head_must_not_run)
+    try:
+        # Deliberately NO outer torch.autocast, matching Trainer.training_step.
+        for _ in range(2):
+            loss, outputs = trainer.compute_loss(
+                prepared, dict(input_ids=ids, labels=labels, attention_mask=mask),
+                return_outputs=True, num_items_in_batch=(labels[:, 1:] != -100).sum(),
+            )
+            assert outputs.logits is None and torch.isfinite(loss)
+            assert getattr(trainer, STEP_ATTR) is not None
+            assert getattr(base, patch._MODEL_STEP) is None
+            (loss * 128).backward()
+    finally:
+        hook.remove()
+    grads = [p.grad for n, p in prepared.named_parameters() if "lora_" in n and p.grad is not None]
+    assert grads and all(torch.isfinite(g).all() for g in grads)
+    assert any(torch.count_nonzero(g) > 0 for g in grads)
+    assert len(records) == 2
+    assert len(trainer._metrics["train"]["entropy"]) == 2
+    assert len(trainer._metrics["train"]["mean_token_accuracy"]) == 2
+    assert trainer._metrics["train"]["num_tokens"] == [2 * mask.sum().item()]
+    diagnostic = capsys.readouterr().err
+    assert diagnostic.count("[solution] fused head active") == 1
+    assert "[solution] fused head disabled" not in diagnostic
+
+
+def test_bridge_without_amp_preserves_dense_fallback(runtime, monkeypatch, capsys):
+    """Skipping outer precision checks must not force fp16 math without AMP."""
+    torch, qwen, sft, _ = runtime
+    import solution.patch as patch
+    from soup_cli.utils.stream_loss_chunk import STEP_ATTR
+
+    monkeypatch.setattr(patch, "_DIAGNOSTICS", set())
+    model = _model(torch, qwen)
+    trainer = _trainer(sft, model)
+    ids, labels, mask = _batch(torch)
+    assert not torch.is_autocast_enabled("cuda")
+    loss, output = trainer.compute_loss(
+        model, dict(input_ids=ids, labels=labels, attention_mask=mask), return_outputs=True,
+    )
+    assert output.logits is not None and output.logits.dtype == torch.float32
+    assert torch.isfinite(loss)
+    assert getattr(trainer, STEP_ATTR) is not None
+    assert len(trainer._metrics["train"]["entropy"]) == 1
+    diagnostic = capsys.readouterr().err
+    assert "fused head disabled: head: CUDA autocast is disabled" in diagnostic
+    assert "fused head active" not in diagnostic
 
 
 def test_empty_accuracy_and_distinct_masks(runtime):

@@ -12,13 +12,50 @@ class, so no setup wrapper or dynamically generated class needs replacing.
 from contextvars import ContextVar
 from functools import wraps
 import importlib
+import sys
 from types import ModuleType
 
-from .utils import enabled, head_eligible, qwen_model, supported_tensor
+from .utils import (enabled, head_ineligibility, parallelism_ineligibility,
+                    qwen_model, supported_tensor, tensor_ineligibility)
 
 _DISABLE_HEAD = ContextVar("soup_fused_disable_head", default=False)
 _MODEL_STEP = "_solution_fused_step"
 _MARKER = "_solution_fused_original"
+_DIAGNOSTICS = set()
+
+
+def _report_head(reason=None):
+    """One refusal and one successful activation per process, independent of measurement."""
+    key = "disabled" if reason is not None else "active"
+    if key not in _DIAGNOSTICS:
+        _DIAGNOSTICS.add(key)
+        message = f"disabled: {reason}" if reason is not None else "active"
+        print(f"[solution] fused head {message}", file=sys.stderr, flush=True)
+
+
+def _bridge_ineligibility(trainer, qwen, inputs):
+    if qwen is None:
+        return "could not unwrap an exact Qwen2ForCausalLM"
+    if not trainer.model.training:
+        return "trainer.model.training=False"
+    if getattr(trainer, "num_virtual_tokens", 0):
+        return f"trainer.num_virtual_tokens={trainer.num_virtual_tokens!r}"
+    if getattr(trainer.args, "use_liger_kernel", False):
+        return "trainer.args.use_liger_kernel=True"
+    if getattr(trainer.args, "loss_type", "nll") != "nll":
+        return f"trainer.args.loss_type={trainer.args.loss_type!r}"
+    if getattr(trainer, "aux_loss_enabled", False):
+        return "trainer.aux_loss_enabled=True"
+    if getattr(trainer, "label_smoother", None) is not None:
+        return "trainer.label_smoother is configured"
+    if getattr(trainer, "compute_loss_func", None) is not None:
+        return "trainer.compute_loss_func is configured"
+    reason = parallelism_ineligibility(getattr(trainer.accelerator, "parallelism_config", None))
+    if reason is not None:
+        return reason
+    # Trainer is outside Accelerate's model.forward autocast boundary. Only
+    # structural conditions belong here; forward rechecks actual precision.
+    return head_ineligibility(qwen, _check_precision=False, **inputs)
 
 
 def _package(name):
@@ -51,18 +88,31 @@ def _patch_head(cls):
         arguments = dict(input_ids=input_ids, attention_mask=attention_mask,
                          position_ids=position_ids, past_key_values=past_key_values,
                          inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
-        eligible = (type(self) is cls and not _DISABLE_HEAD.get()
-                    and head_eligible(self, labels, logits_to_keep, **kwargs))
-        if not eligible:
+        if type(self) is not cls:
+            reason = f"model type is {type(self).__name__} (requires exact Qwen2ForCausalLM)"
+        elif _DISABLE_HEAD.get():
+            reason = str(_DISABLE_HEAD.get())
+        else:
+            reason = head_ineligibility(self, labels, logits_to_keep, **kwargs)
+        if reason is not None:
+            if self.training:
+                _report_head(f"head: {reason}")
             return original(self, labels=labels, logits_to_keep=logits_to_keep, **arguments)
         outputs = self.model(**arguments)
         hidden = outputs.last_hidden_state
         # Unsupported decoder layouts still use its already-computed result.
-        if (not supported_tensor(hidden) or hidden.shape[:2] != labels.shape
-                or hidden.device != self.lm_head.weight.device
-                or hidden.shape[-1] != self.lm_head.weight.shape[1]
-                or (not torch.is_autocast_enabled("cuda")
-                    and hidden.dtype != self.lm_head.weight.dtype)):
+        reason = tensor_ineligibility(hidden, "hidden")
+        if reason is None:
+            if hidden.shape[:2] != labels.shape:
+                reason = f"hidden shape={tuple(hidden.shape)} does not align with labels={tuple(labels.shape)}"
+            elif hidden.device != self.lm_head.weight.device:
+                reason = "hidden and lm_head.weight are on different devices"
+            elif hidden.shape[-1] != self.lm_head.weight.shape[1]:
+                reason = "hidden width differs from lm_head.weight width"
+            elif not torch.is_autocast_enabled("cuda") and hidden.dtype != self.lm_head.weight.dtype:
+                reason = "hidden and lm_head.weight dtypes differ outside CUDA autocast"
+        if reason is not None:
+            _report_head(f"head: {reason}")
             logits = self.lm_head(hidden)
             loss = self.loss_function(logits=logits, labels=labels,
                                       vocab_size=self.config.vocab_size, **kwargs)
@@ -71,6 +121,7 @@ def _patch_head(cls):
                                     kwargs.get("num_items_in_batch"))
             setattr(self, _MODEL_STEP, step)
             logits = None
+            _report_head()
         return CausalLMOutputWithPast(
             loss=loss, logits=logits, past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states, attentions=outputs.attentions,
@@ -153,19 +204,11 @@ def _patch_trainer(cls, qwen_cls, trainer_cls, step_attr):
         qwen = qwen_model(model, qwen_cls)
         if qwen is not None:
             setattr(qwen, _MODEL_STEP, None)
-        use_bridge = (
-            qwen is not None and self.model.training
-            and not getattr(self, "num_virtual_tokens", 0)
-            and not getattr(self.args, "use_liger_kernel", False)
-            and getattr(self.args, "loss_type", "nll") == "nll"
-            and not getattr(self, "aux_loss_enabled", False)
-            and getattr(self, "label_smoother", None) is None
-            and getattr(self, "compute_loss_func", None) is None
-            and getattr(self.accelerator, "parallelism_config", None) is None
-            and head_eligible(qwen, **inputs)
-        )
-        if not use_bridge:
-            token = _DISABLE_HEAD.set(True)
+        reason = _bridge_ineligibility(self, qwen, inputs)
+        if reason is not None:
+            if self.model.training:
+                _report_head(f"bridge: {reason}")
+            token = _DISABLE_HEAD.set(f"bridge: {reason}")
             try:
                 return original(self, model, inputs, return_outputs=return_outputs,
                                 num_items_in_batch=num_items_in_batch)
