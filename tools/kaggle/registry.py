@@ -21,6 +21,7 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
+EXPERIMENT_VALUES = {"SOUP_EXP_PRECOMPILE": frozenset({"1", "process"})}
 METRICS = ("wall_s", "loop_s", "first_step_s", "median_step_s", "peak_mib", "eval_loss", "own_share")
 CSV_FIELDS = (
     "experiment", "commit", "owner", "family", "params", "wall_s", "loop_s", "first_step_s",
@@ -29,6 +30,14 @@ CSV_FIELDS = (
     "timed_loop_s", "ok", "harness_exit_code", "train_exit_code", "eval_exit_code", "error",
     "result_file", "metrics_file", "local_artifact_root",
 )
+
+
+def validate_experiment_flag(key, value):
+    """Share the explicit opt-in allowlist between --variants and --env."""
+    if (not re.fullmatch(r"SOUP_EXP_[A-Z][A-Z0-9_]*", key)
+            or value not in EXPERIMENT_VALUES.get(key, {"1"})):
+        raise ValueError("experiment flags require SOUP_EXP_NAME=1; "
+                         "SOUP_EXP_PRECOMPILE also accepts process")
 
 
 def parse_variants(spec):
@@ -43,9 +52,9 @@ def parse_variants(spec):
         environment = {}
         for setting in settings.split(",") if settings else ():
             key, equals, value = setting.strip().partition("=")
-            if (not equals or not re.fullmatch(r"SOUP_EXP_[A-Z][A-Z0-9_]*", key)
-                    or value != "1" or key in environment):
-                raise ValueError("variants accept only unique opt-in SOUP_EXP_NAME=1 flags")
+            if not equals or key in environment:
+                raise ValueError("variants require unique experiment flags with explicit values")
+            validate_experiment_flag(key, value)
             environment[key] = value
         variants.append({"name": name, "env": environment})
     if len(variants) < 2 or variants[0] != {"name": "A", "env": {}}:

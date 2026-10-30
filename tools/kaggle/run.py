@@ -130,6 +130,11 @@ def env_pair(value):
     if (not separator or not re.fullmatch(r"SOUP_[A-Za-z0-9_]+", key)
             or key == "SOUP_APPLY_SOLUTION" or "\0" in setting):
         raise argparse.ArgumentTypeError("--env requires SOUP_KEY=VALUE; SOUP_APPLY_SOLUTION is reserved")
+    if key.startswith("SOUP_EXP_"):
+        try:
+            registry.validate_experiment_flag(key, setting)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
     return key, setting
 
 
@@ -337,9 +342,9 @@ def main():
     launch.add_argument("--mode", choices=("unit", "solution", "full", "full2", "probe", "bench", "ab"), required=True)
     launch.add_argument("--dry-run", action="store_true", help="Build notebook/metadata without invoking Kaggle")
     launch.add_argument("--env", action="append", type=env_pair, default=[], metavar="SOUP_KEY=VALUE",
-                        help="Experiment flag (repeatable); SOUP_APPLY_SOLUTION is reserved")
+                        help="Repeatable; SOUP_EXP_* accepts 1 (PRECOMPILE also process); SOUP_APPLY_SOLUTION is reserved")
     launch.add_argument("--tag", type=experiment_tag, default="", help="Run label for kernel slug and output directory")
-    launch.add_argument("--variants", help="ab only: A=;B=SOUP_EXP_NAME=1;C=SOUP_EXP_OTHER=1")
+    launch.add_argument("--variants", help="ab only: A=;B=SOUP_EXP_NAME=1 (PRECOMPILE also accepts process)")
     launch.add_argument("--rounds", type=int, help="ab only: paired rounds (default 4; use an even count)")
     launch.set_defaults(handler=run)
     args = parser.parse_args()
