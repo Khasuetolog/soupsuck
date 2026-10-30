@@ -1,6 +1,7 @@
 data/
 runs/
 runs_*/
+runs_kaggle/
 __pycache__/
 *.pyc
 .pytest_cache/
