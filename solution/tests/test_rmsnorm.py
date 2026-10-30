@@ -1,0 +1,145 @@
+"""Qwen2 RMSNorm forward/backward acceptance tests (run on CUDA/T4)."""
+
+import pytest
+
+torch = pytest.importorskip("torch")
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
+
+# Fixed tolerances; the mixed-dtype path includes fp16 rounding in backward.
+FP32_TOL = dict(rtol=1e-5, atol=1e-5)
+FP16_TOL = dict(rtol=2e-3, atol=2e-3)
+
+
+def _qwen2_reference(x, weight, eps):
+    input_dtype = x.dtype
+    values = x.to(torch.float32)
+    variance = values.pow(2).mean(-1, keepdim=True)
+    values = values * torch.rsqrt(variance + eps)
+    return weight * values.to(input_dtype)
+
+
+def _check(x, weight, eps=1e-6, grad=None):
+    from solution.kernels import rms_norm
+
+    xr = x.detach().clone().requires_grad_(x.requires_grad)
+    wr = weight.detach().clone().requires_grad_(weight.requires_grad)
+    expected = _qwen2_reference(xr, wr, eps)
+    actual = rms_norm(x, weight, eps)
+    tol = FP32_TOL if x.dtype == weight.dtype == torch.float32 else FP16_TOL
+    assert actual.shape == x.shape
+    assert actual.dtype == torch.promote_types(x.dtype, weight.dtype)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, **tol)
+    if grad is None:
+        grad = torch.randn_like(actual)
+    expected.backward(grad)
+    actual.backward(grad)
+    if x.requires_grad:
+        assert x.grad.dtype == x.dtype
+        assert torch.isfinite(x.grad).all()
+        torch.testing.assert_close(x.grad, xr.grad, **tol)
+    if weight.requires_grad:
+        assert weight.grad.dtype == weight.dtype
+        assert torch.isfinite(weight.grad).all()
+        torch.testing.assert_close(weight.grad, wr.grad, **tol)
+    else:
+        assert weight.grad is None
+    return actual
+
+
+@pytest.mark.parametrize("shape", [(4, 512, 1536), (3, 77, 1536), (2, 5, 1000)])
+@pytest.mark.parametrize("input_dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("weight_dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("train_weight", [False, True])
+def test_matches_qwen2_forward_and_gradients(shape, input_dtype, weight_dtype, train_weight):
+    torch.manual_seed(456)
+    x = torch.randn(shape, device="cuda", dtype=input_dtype, requires_grad=True)
+    weight = torch.randn(shape[-1], device="cuda", dtype=weight_dtype, requires_grad=train_weight)
+    _check(x, weight)
+
+
+@pytest.mark.parametrize("input_dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("weight_dtype", [torch.float32, torch.float16])
+def test_large_values_stay_finite(input_dtype, weight_dtype):
+    torch.manual_seed(789)
+    x = (torch.randn((3, 77, 1536), device="cuda", dtype=input_dtype) * 1000).requires_grad_()
+    weight = torch.randn(1536, device="cuda", dtype=weight_dtype, requires_grad=True)
+    _check(x, weight, eps=1e-5)
+
+
+def test_repeated_calls_accumulate_gradients():
+    from solution.kernels import rms_norm
+
+    torch.manual_seed(123)
+    x = torch.randn((2, 5, 1000), device="cuda", dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(1000, device="cuda", dtype=torch.float32, requires_grad=True)
+    xr = x.detach().clone().requires_grad_()
+    wr = weight.detach().clone().requires_grad_()
+    first, second = rms_norm(x, weight, 1e-6), rms_norm(x, weight, 1e-6)
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
+    grad_first, grad_second = torch.randn_like(first), torch.randn_like(first)
+    first.backward(grad_first)
+    second.backward(grad_second)
+    _qwen2_reference(xr, wr, 1e-6).backward(grad_first + grad_second)
+    torch.testing.assert_close(x.grad, xr.grad, **FP32_TOL)
+    torch.testing.assert_close(weight.grad, wr.grad, **FP32_TOL)
+
+
+@pytest.mark.parametrize("shape", [(1536,), (2, 1, 3, 1000), (0, 3, 1000)])
+def test_arbitrary_leading_shapes(shape):
+    torch.manual_seed(234)
+    x = torch.randn(shape, device="cuda", dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(shape[-1], device="cuda", dtype=torch.float32, requires_grad=True)
+    _check(x, weight)
+
+
+def test_strided_leading_dimensions_without_input_copy():
+    torch.manual_seed(321)
+    x = torch.randn((3, 4, 1000), device="cuda").transpose(0, 1).detach().requires_grad_()
+    weight = torch.randn(2000, device="cuda")[::2].detach().requires_grad_()
+    assert x.stride(-1) == 1 and not x.is_contiguous()
+    assert weight.stride(0) == 2
+    _check(x, weight)
+
+
+def test_broadcast_upstream_and_weight_gradient_only():
+    torch.manual_seed(345)
+    x = torch.randn((2, 5, 1000), device="cuda")
+    weight = torch.randn(1000, device="cuda", requires_grad=True)
+    grad = torch.tensor(0.25, device="cuda").expand_as(x)
+    assert grad.stride(-1) == 0
+    _check(x, weight, grad=grad)
+
+
+def test_zero_rows_and_zero_input():
+    x = torch.zeros((2, 5, 1000), device="cuda", requires_grad=True)
+    weight = torch.ones(1000, device="cuda", requires_grad=True)
+    _check(x, weight)
+
+
+def test_half_cast_occurs_before_weight_multiply():
+    from solution.kernels import rms_norm
+
+    # Small fixed rows keep the half-rounded normalization away from midpoints,
+    # so a different fp32 reduction order cannot change this cast-order check.
+    x = torch.tensor([[1, 1, 2, 2], [3, 3, 4, 4]], device="cuda", dtype=torch.float16)
+    weight = torch.tensor([0.1, 0.9, 1.7, 3.0], device="cuda", dtype=torch.float32)
+    actual = rms_norm(x, weight, 1e-6)
+    expected = _qwen2_reference(x, weight, 1e-6)
+    values = x.float()
+    other_order = weight * (values * torch.rsqrt(values.square().mean(-1, keepdim=True) + 1e-6))
+    assert actual.dtype == torch.float32
+    assert (expected != other_order).any()
+    # fp32 output contains the exact product of rounded fp16 q and fp32 weight.
+    torch.testing.assert_close(actual, expected, **FP32_TOL)
+
+
+def test_invalid_layout_and_cpu_raise_value_error():
+    from solution.kernels import rms_norm
+
+    with pytest.raises(ValueError, match="CUDA"):
+        rms_norm(torch.ones(2, 5), torch.ones(5), 1e-6)
+    x = torch.randn((2, 5, 1000), device="cuda")[..., ::2]
+    with pytest.raises(ValueError, match="contiguous"):
+        rms_norm(x, torch.ones(500, device="cuda"), 1e-6)
