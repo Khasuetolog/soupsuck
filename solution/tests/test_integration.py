@@ -2,6 +2,7 @@
 
 from collections import defaultdict
 import copy
+import json
 import sys
 import importlib
 from pathlib import Path
@@ -197,6 +198,41 @@ def test_nf4_registration_waits_for_both_modules_and_root(monkeypatch):
     root.__spec__._initializing = False
     patch._register_module(functional.__name__, functional)
     assert calls == ["installed"]
+
+
+def test_soup_embedding_callback_ignores_fake_class_and_fake_model(monkeypatch):
+    import solution.patch as patch
+    import solution.embedding as embedding
+
+    root = ModuleType("soup_cli")
+    root.__path__ = []
+    module = ModuleType(patch._SOUP_MODULE)
+    monkeypatch.setitem(sys.modules, "soup_cli", root)
+    class FakeWrapper:
+        def _setup_transformers(self):
+            return "fake-original"
+    original = FakeWrapper._setup_transformers
+    module.SFTTrainerWrapper = FakeWrapper
+    patch._register_module(module.__name__, module)
+    assert FakeWrapper._setup_transformers is original
+    calls = []
+    def setup(self):
+        calls.append("original")
+        self.model = SimpleNamespace()
+        return "same-result"
+    cls = type("SFTTrainerWrapper", (), {"__module__": patch._SOUP_MODULE, "_setup_transformers": setup})
+    module.SFTTrainerWrapper = cls
+    class TensorModule:
+        pass
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(nn=SimpleNamespace(Module=TensorModule)))
+    def must_not_compress(model):
+        raise AssertionError("Fake model must not be compressed")
+    monkeypatch.setattr(embedding, "compress_tied_embedding", must_not_compress)
+    patch._register_module(module.__name__, module)
+    installed = cls._setup_transformers
+    patch._register_module(module.__name__, module)
+    assert cls._setup_transformers is installed
+    assert cls()._setup_transformers() == "same-result" and calls == ["original"]
 
 
 def test_apply_with_fake_modules(monkeypatch):
@@ -516,6 +552,18 @@ def test_nf4_hooks_registered_after_bnb_import(runtime):
     assert installed == (functional.dequantize_4bit, ops._dequantize_4bit_impl)
 
 
+def test_soup_embedding_setup_registration_after_import(runtime):
+    from soup_cli.trainer.sft import SFTTrainerWrapper
+    from solution.embedding import _MARKER
+    import solution
+
+    solution.apply()
+    installed = SFTTrainerWrapper._setup_transformers
+    assert hasattr(installed, _MARKER)
+    solution.apply()
+    assert SFTTrainerWrapper._setup_transformers is installed
+
+
 @pytest.mark.parametrize("training", [True, False])
 def test_dense_qwen_without_amp_keeps_all_norm_outputs_full_precision(runtime, monkeypatch, training):
     torch, qwen, _, _ = runtime
@@ -578,6 +626,8 @@ def test_input_final_half_norm_with_real_bnb_lora_preserves_dropout(runtime, mon
                 param.normal_(0, 0.03)
     ids, labels, mask = _batch(torch)
     masks, requests, ingress = [], [], []
+    operands = {"reference": {}, "half": {}}
+    phase = {"name": "reference"}
     hooks = []
     for index, block in enumerate(base.model.layers):
         for key in ("q_proj", "v_proj"):
@@ -585,6 +635,20 @@ def test_input_final_half_norm_with_real_bnb_lora_preserves_dropout(runtime, mon
             def capture(module, args, output, label=(index, key)):
                 masks.append((label, args[0].dtype, (output.detach() != 0).clone()))
             hooks.append(projection.lora_dropout["default"].register_forward_hook(capture))
+    for name, module in wrapped.named_modules():
+        if type(module) is torch.nn.Linear and ("lora_A." in name or "lora_B." in name):
+            def capture_linear(module, args, output, key=name + ".weight"):
+                # Actual fp16 GEMM operands, independent of the global model
+                # precision change. The output hook sees the gradient AFTER
+                # LoRA scaling, exactly as Linear.backward receives it.
+                record = {"x": args[0].detach().half().clone()}
+                operands[phase["name"]][key] = record
+                if output.requires_grad:
+                    assert output.dtype == torch.float16
+                    def capture_grad(grad):
+                        record["g"] = grad.detach().half().clone()
+                    output.register_hook(capture_grad)
+            hooks.append(module.register_forward_hook(capture_linear))
     norm_forward = norm_module.rms_norm
     def observed_norm(x, weight, eps, out_dtype=None):
         requests.append((id(weight), out_dtype))
@@ -606,6 +670,7 @@ def test_input_final_half_norm_with_real_bnb_lora_preserves_dropout(runtime, mon
         (expected * 128).backward()
         gradients = {name: p.grad.detach().clone() for name, p in wrapped.named_parameters()
                      if "lora_" in name and p.grad is not None}
+        phase["name"] = "half"
         reference_masks = list(masks)
         masks.clear()
         requests.clear()
@@ -629,13 +694,47 @@ def test_input_final_half_norm_with_real_bnb_lora_preserves_dropout(runtime, mon
         norm_ids.add(id(base.model.norm.weight))
         assert all((key, torch.float16) in requests for key in norm_ids)
         torch.testing.assert_close(actual, expected, rtol=5e-3, atol=3e-3)
+        def ideal_error(gradient, record):
+            x = record["x"].reshape(-1, record["x"].shape[-1]).double()
+            g = record["g"].reshape(-1, record["g"].shape[-1]).double()
+            ideal = g.t() @ x
+            # Half products are exact in fp32. A length-N fp32 accumulation
+            # has error <= gamma_N * sum(abs(g*x)); permit one final half ULP
+            # for the AMP gradient store/double-rounding boundary. No bound
+            # is chosen from the observed difference between model variants.
+            neps = x.shape[0] * torch.finfo(torch.float32).eps
+            accumulation = (neps / (1 - neps)) * (g.abs().t() @ x.abs())
+            rounded = ideal.half()
+            assert torch.isfinite(rounded).all()
+            above = torch.nextafter(rounded, torch.full_like(rounded, float("inf"))).double()
+            below = torch.nextafter(rounded, torch.full_like(rounded, -float("inf"))).double()
+            ulp = torch.maximum((above - rounded.double()).abs(), (rounded.double() - below).abs())
+            error = (gradient.double() - ideal).abs()
+            return error, accumulation + ulp
         for name, param in wrapped.named_parameters():
             if name not in gradients:
                 continue
             ref = gradients[name]
             assert param.grad is not None and torch.isfinite(param.grad).all()
-            torch.testing.assert_close(param.grad, ref, rtol=3e-2, atol=5e-4, msg=name)
-            assert torch.linalg.vector_norm(param.grad - ref) <= 3e-2 * torch.linalg.vector_norm(ref) + 1e-6, name
+            difference = param.grad - ref
+            relative_norm = torch.linalg.vector_norm(difference) / torch.linalg.vector_norm(ref).clamp_min(1e-30)
+            worst = difference.abs().argmax()
+            diagnostics = {"parameter": name, "max_abs_difference": difference.abs().max().item(),
+                           "reference_max_abs": ref.abs().max().item(),
+                           "actual_at_worst": param.grad.reshape(-1)[worst].item(),
+                           "reference_at_worst": ref.reshape(-1)[worst].item(),
+                           "relative_norm_error": relative_norm.item()}
+            for variant, gradient in (("reference", ref), ("half", param.grad)):
+                error, bound = ideal_error(gradient, operands[variant][name])
+                diagnostics[f"{variant}_fp64_max_error"] = error.max().item()
+                diagnostics[f"{variant}_fp64_bound_max"] = bound.max().item()
+                assert (error <= bound).all(), json.dumps(diagnostics)
+            # Half ingress perturbs activations and their upstream gradients;
+            # cancellation makes entrywise relative error ill-conditioned.
+            # Keep the original model-level 3% norm criterion unchanged, while
+            # testing each contraction against the fp64 ideal above.
+            print("LoRA gradient precision:", json.dumps(diagnostics))
+            assert torch.linalg.vector_norm(difference) <= 3e-2 * torch.linalg.vector_norm(ref) + 1e-6, json.dumps(diagnostics)
         # If LoRA cannot promise fp32 dropout, its input norm MUST stay full
         # precision, so the original PEFT path never sees an unsafe half input.
         first = base.model.layers[0]

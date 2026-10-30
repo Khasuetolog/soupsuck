@@ -195,8 +195,8 @@ def test_decoder_patch_signature_kwargs_and_idempotency(monkeypatch, half_output
     residual = ref_hidden + delta
     normed = _norm_reference(residual, layer.post_attention_layernorm.weight,
                              layer.post_attention_layernorm.variance_epsilon)
-    if half_output:
-        normed = normed.half()
+    # The substituted MLP is arbitrary and has no certified fp16 projection
+    # consumers. The env switch is a request, not permission to narrow it.
     expected = residual + (normed * 0.25).half()
     arguments = dict(attention_mask=torch.ones((2, 5), device="cuda"),
                      position_ids=torch.arange(5, device="cuda")[None, :],
@@ -206,7 +206,7 @@ def test_decoder_patch_signature_kwargs_and_idempotency(monkeypatch, half_output
     actual = layer(hidden, **arguments)
     for key, value in arguments.items():
         assert layer.self_attn.seen[key] is value
-    assert layer.mlp.seen_dtype == (torch.float16 if half_output else torch.float32)
+    assert layer.mlp.seen_dtype == torch.float32
     torch.testing.assert_close(actual, expected, **FP16_TOL)
     upstream = torch.randn_like(actual)
     actual.backward(upstream)

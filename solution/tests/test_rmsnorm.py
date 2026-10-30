@@ -11,6 +11,30 @@ FP32_TOL = dict(rtol=1e-5, atol=1e-5)
 FP16_TOL = dict(rtol=2e-3, atol=2e-3)
 
 
+def _assert_half_store_roundoff(actual, expected):
+    """One adjacent half value on at most 1/1000 random entries, fixed a priori.
+
+    Half-output and fp32-output kernels have different store types and can
+    compile to different arithmetic instructions. A last-bit fp32 product/
+    rsqrt/reduction difference at a half midpoint can select the neighboring
+    half value. This sparse-midpoint criterion is separate from the strict
+    controlled-row cast test below; it does not allow a dense half-ULP bias.
+    """
+    assert actual.dtype == expected.dtype == torch.float16
+    a, e = actual.detach(), expected.detach()
+    assert torch.isfinite(a).all() and torch.isfinite(e).all()
+    above = torch.nextafter(e, torch.full_like(e, float("inf"))).float()
+    below = torch.nextafter(e, torch.full_like(e, -float("inf"))).float()
+    upper, lower = (above - e.float()).abs(), (e.float() - below).abs()
+    upper = torch.where(torch.isfinite(upper), upper, lower)
+    lower = torch.where(torch.isfinite(lower), lower, upper)
+    ulp = torch.maximum(upper, lower)
+    error = (a.float() - e.float()).abs()
+    assert (error <= ulp).all(), f"half-store error exceeds one ULP: max_abs={error.max().item()}"
+    changed = int((a != e).sum())
+    assert changed * 1000 <= a.numel(), f"half-store rounding changed {changed}/{a.numel()} (>1/1000)"
+
+
 def _qwen2_reference(x, weight, eps):
     input_dtype = x.dtype
     values = x.to(torch.float32)
@@ -195,12 +219,12 @@ def test_fused_output_half_rounding_and_gradients(input_dtype, weight_dtype, tra
     xr = x.detach().clone().requires_grad_()
     wr = weight.detach().clone().requires_grad_(train_weight)
     actual = rms_norm(x, weight, 1e-6, out_dtype=torch.float16)
-    # The new option changes only the final store dtype: the same kernel's
-    # uncast result is a strict oracle, irrespective of fp32 reduction order.
+    # Changing the store dtype may change final code generation near a half
+    # midpoint; constrain both ULP distance and frequency on random inputs.
     exact = rms_norm(x.detach(), weight.detach(), 1e-6)
-    torch.testing.assert_close(actual, exact.half(), rtol=0, atol=0)
+    _assert_half_store_roundoff(actual, exact.half())
     reference = _qwen2_reference(xr, wr, 1e-6).half()
-    torch.testing.assert_close(actual, reference, **FP16_TOL)
+    _assert_half_store_roundoff(actual, reference)
     grad = torch.randn_like(actual)
     actual.backward(grad)
     reference.backward(grad)
@@ -222,7 +246,10 @@ def test_fused_half_output_bitwise_qwen_reference(input_dtype):
                      device="cuda", dtype=input_dtype)
     weight = torch.tensor([0.5, 1, 1.5, 2] * 20, device="cuda", dtype=torch.float32)
     actual = rms_norm(x, weight, 1e-6, out_dtype=torch.float16)
-    torch.testing.assert_close(actual, _qwen2_reference(x, weight, 1e-6).half(), rtol=0, atol=0)
+    own_reference = rms_norm(x, weight, 1e-6).half()
+    eager_reference = _qwen2_reference(x, weight, 1e-6).half()
+    assert torch.equal(actual.view(torch.int16), own_reference.view(torch.int16))
+    assert torch.equal(actual.view(torch.int16), eager_reference.view(torch.int16))
 
 
 def test_half_output_sequence_lengths_reuse_variants():

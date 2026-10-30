@@ -359,8 +359,9 @@ def _patch_lazy_mlp(cls):
 _QWEN_MODULE = "transformers.models.qwen2.modeling_qwen2"
 _TRL_MODULE = "trl.trainer.sft_trainer"
 _BNB_MODULE = "peft.tuners.lora.bnb"
+_SOUP_MODULE = "soup_cli.trainer.sft"
 _NF4_MODULES = {"bitsandbytes", "bitsandbytes.functional", "bitsandbytes.backends.cuda.ops"}
-_TARGET_MODULES = {_QWEN_MODULE, _TRL_MODULE, _BNB_MODULE, *_NF4_MODULES}
+_TARGET_MODULES = {_QWEN_MODULE, _TRL_MODULE, _BNB_MODULE, _SOUP_MODULE, *_NF4_MODULES}
 _IMPORT_FINDER = None
 
 
@@ -378,8 +379,10 @@ def _register_module(name, module):
         _patch_head(module.Qwen2ForCausalLM)
         _patch_norm(module.Qwen2RMSNorm)
         from .decoder import patch_qwen2_decoder
+        from .rope import patch_qwen2_rope
 
         patch_qwen2_decoder()
+        patch_qwen2_rope(module)
         _patch_lazy_mlp(module.Qwen2MLP)
     elif name == _TRL_MODULE:
         cls = getattr(module, "SFTTrainer", None)
@@ -399,6 +402,13 @@ def _register_module(name, module):
             from .lora import _patch_class
 
             _patch_class(cls, tuple(module.VARIANT_KWARG_KEYS))
+    elif name == _SOUP_MODULE:
+        cls = getattr(module, "SFTTrainerWrapper", None)
+        if (isinstance(cls, type) and cls.__module__ == name
+                and callable(getattr(cls, "_setup_transformers", None))):
+            from .embedding import patch_soup_setup_embedding
+
+            patch_soup_setup_embedding(cls)
     elif name in _NF4_MODULES:
         loaded = {key: sys.modules.get(key) for key in _NF4_MODULES}
         if not all(isinstance(value, ModuleType) for value in loaded.values()):
