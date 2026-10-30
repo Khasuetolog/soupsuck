@@ -384,6 +384,9 @@ def _register_module(name, module):
         patch_qwen2_decoder()
         patch_qwen2_rope(module)
         _patch_lazy_mlp(module.Qwen2MLP)
+        from .unpad import patch_qwen2_unpad
+
+        patch_qwen2_unpad(module)
     elif name == _TRL_MODULE:
         cls = getattr(module, "SFTTrainer", None)
         # TRL 0.29.1 imports BaseTrainer, not Trainer into this module.
