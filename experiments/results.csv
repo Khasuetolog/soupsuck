@@ -1,1 +1,2 @@
 experiment,commit,owner,family,params,wall_s,loop_s,first_step_s,peak_mib,speedup,memory_ratio,eval_delta_pct,checks,decision
+EXP-002,73a1372,codex-2,F,SOUP_EXP_NF4_GEMM=1 microbench,,,,,,,,correct,rejected (4.1-66x slower than decode+cuBLAS)
