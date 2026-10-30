@@ -465,7 +465,8 @@ def install():
     Python calls exec_module before returning the imported module to its caller;
     dynamic Soup subclasses therefore see patched TRL methods. Modules imported
     before apply are handled immediately; markers keep both paths idempotent.
-    No CUDA kernel is imported or compiled here.
+    No CUDA kernel is imported or compiled here by default. The explicit
+    EXP-001 flag starts measured-run preparation on background threads.
     """
     global _IMPORT_FINDER
     if _IMPORT_FINDER is None:
@@ -475,3 +476,7 @@ def install():
         module = sys.modules.get(name)
         if module is not None:
             _register_module(name, module)
+    if os.environ.get("SOUP_EXP_PRECOMPILE") == "1":
+        from .precompile import start
+
+        start()
