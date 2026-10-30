@@ -99,7 +99,8 @@ def push_code(args):
             exists = kaggle("datasets", "metadata", dataset, "-p", probe, check=False)
             if exists.returncode == 0:
                 metadata = json.loads((Path(probe) / "dataset-metadata.json").read_text())
-                if metadata.get("isPrivate") is not True:
+                # CLI 2.2.5 nests dataset fields under "info".
+                if metadata.get("info", metadata).get("isPrivate") is not True:
                     raise RuntimeError("Existing dataset is not confirmed private; set its visibility to private")
                 update = True
             elif re.search(r"\b404\b|\bnot found\b", exists.stdout + exists.stderr, re.I):
