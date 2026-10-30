@@ -516,3 +516,225 @@ allocation проверки, независимый default-flags full-vocabular
 `runs_kaggle/20261030T105526661826Z_full_de836e0/out/runs/checks.json` с 10/10 PASS
 и own share 8.6%; это закрывает прежнее отсутствие evidence именно для той пары.
 Ни NF4 d228f99, ни CE 8f8ebbc не наследуют это измерение автоматически.
+
+
+## S-023 — S-016: fp16 нормы, readiness guards и NF4 registration
+
+Дата: 2026-10-30. Проверен только коммит **3c560d1ff1a468c7dfb8cea81435f5b6c0894ca1**:
+`solution/patch.py`, `decoder.py`, `lora.py`, `kernels/rmsnorm.py` и изменённые
+integration/RMSNorm tests. Неотслеживаемые или последующие файлы не ревьюились.
+Изменён только этот отчёт; коммитов и Kaggle-запусков нет.
+
+**Итог:** P1-2 (dense fp32 MLP без AMP) логически закрыт. Scope reset, исходный
+dtype для dgamma и последовательность NF4 post-import callbacks согласованы.
+Нового доказанного P0 нет. Есть **P1 численного риска input-norm compression**:
+одинаковые dropout masks не дают одинаковых значений LoRA и не доказывают
+эквивалентности backward накопления. Это не утверждение о проваленном check —
+для нового default необходим paired T4 результат. Условный runtime отказ LoRA
+разобран отдельно ниже: обычного пути от alignment к такому отказу не найдено.
+
+### P1-023-1 — fp16 input norm не является точным переносом cast через LoRA/dropout
+
+- **Файл:строка:** `solution/patch.py:64`–`:83`, `solution/lora.py:97`,
+  `:119`–`:123`; `solution/decoder.py:64`–`:68`.
+- **Доказательство forward:** новый default разрешает fp16 input norm для q/v
+  PEFT bnb LoRA. В baseline LoRA dropout потребляет исходный fp32 norm output,
+  **до** autocast A projection. Патч использует `x16.float()` перед тем же
+  dropout. Условия readiness доказывают допустимость этой ветки и RNG-путь,
+  но не равенство её значений: раннее half округление не коммутирует с
+  умножением dropout на `1/(1-p)`.
+- **Независимый локальный численный пример:** сохранённый элемент dropout,
+  p=0.05, x32=**0.10006000101566315**, round_half(x32)=**0.10003662109375**,
+  scale32=**1.0526316165924072**. Перед fp16 GEMM A:
+  baseline `half(fp32(x32*scale32))` = **0.1053466796875**,
+  half-ingress `half(fp32(float(half(x32))*scale32))` = **0.10528564453125**.
+  Маска для этого элемента одинакова — он сохранён в обоих случаях.
+  Пример рассчитан Python stdlib `struct` с явными IEEE fp32/fp16 округлениями,
+  без CUDA и без предположения о случайном seed:
+
+  ```python
+  import struct
+  f32 = lambda x: struct.unpack('f', struct.pack('f', x))[0]
+  f16 = lambda x: struct.unpack('e', struct.pack('e', x))[0]
+  x, scale = f32(0.10006), f32(1/0.95)
+  assert f16(f32(x*scale)) != f16(f32(f32(f16(x))*scale))
+  ```
+
+- **Доказательство backward границы:** нормализованный tensor теперь fp16 и
+  разделяется между q/k/v. Baseline отдельные fp16 cast edges возвращают
+  вклады к общему fp32 norm tensor; новый общий fp16 tensor получает вклады в
+  half. Накопление в half в общем случае отличается от fp32 accumulation до
+  RMSNorm Jacobian. Например, две представимые half величины 1 и 2^-11:
+  fp32 сумма **1.00048828125**, half сумма **1.0**. Это дополнительная граница
+  округления, даже если бы forward потребители совпадали. Wrapper q/v также
+  возвращает base/result в другом dtype, согласно bnb inp_dtype контракту.
+- **Как доказать на T4:** существующий
+  `test_input_final_half_norm_with_real_bnb_lora_preserves_dropout` сравнивает
+  RNG/masks, loss и toleranced LoRA gradients, но сравнение выполняется при
+  одновременно изменённых input/final norms. Добавить isolated input-norm
+  сравнение с nonzero LoRA B и штатным p=0.05, сохранить logits/loss, dx
+  input norm и adapter gradients на нескольких seed; затем checks 5–7
+  paired с baseline. Численный пример выше не доказывает превышение допусков.
+- **Минимальное решение:** если требуется точная предпосылка «потребители
+  уже кастовали и результат тот же», оставить input norm fp32 при активной
+  LoRA dropout/многоветочном потреблении. Если принимается приближённая
+  оптимизация, явно описать это ограничение и подтвердить допуски качества
+  новым T4 full comparison; не выдавать RNG equality за numerical equality.
+- **Влияние:** дополнительное округление может изменить adapter updates,
+  loss curve и held-out quality на другом seed/скрытых строках; величина
+  эффекта UNVERIFIED. fp32 input norm уменьшает выигрыш памяти и возвращает
+  downstream casts; точного измеренного overhead этой альтернативы нет.
+
+### 1. Потребители fp16 и согласованность readiness с настоящим LoRA forward
+
+| Потребитель | Что проверено |
+| --- | --- |
+| q/k/v direct dense Linear | `_plain_half_consumer:47` требует CUDA fp16 autocast, same-device supported weight, exact nn.Linear, отсутствие instance override/hooks. Каждая исходная linear действительно кастует operands до GEMM. Несколько потребителей всё равно имеют backward границу P1-023-1. |
+| k direct bnb Linear4bit | Exact module/name, frozen parameters, compute_dtype=fp16, compute_type_is_set и quant_state; fixed bnb forward кастует input до matmul. Он возвращает inp_dtype: forward значения до последующего потребления могут совпадать, dtype и gradient accumulation уже не обязаны совпасть. |
+| q/v LoRA | `fp16_ingress_ready` требует actual PEFT Linear4bit type, установленный wrapper marker, отсутствие wrapper/base hooks и overrides, base compute fp16 и готовый quant state. Затем вызывает **тот же** `_eligible`, подставляя будущий input_dtype=fp16. Original Qwen2Attention вызывает q/k/v без дополнительных projection kwargs; mixed-adapter prehooks были бы отклонены. |
+| Post-attention MLP | `_post_norm_half_ready:106` требует реальный Qwen2MLP без hooks/instance override, одинаковые projection types и проверку каждой projection. fp32 dense MLP без AMP отклоняется; frozen bnb fp16 может пройти и без AMP. Это убирает прежний dtype crash, но не является общим доказательством всех промежуточных rounding для любого нестандартного activation. Fixed task использует исходный SiLU и собственный fused MLP. |
+| Final head | `_final_norm_half_ready:86` требует CUDA fp16 autocast, exact nn.Linear, supported same-device weight, отсутствие model/norm/head hooks и запроса output_hidden_states. Dense AMP head действительно потребляет fp16 operands; fused head также кастует hidden. При head fallback эта оптимизация может работать, но не включается без AMP. |
+
+**Проверка alignment и позднего отказа:** `_eligible` применяет один и тот же
+`data_ptr()%16` check в preflight и actual forward. Preflight смотрит на
+исходный residual x, а actual смотрит на **новый** output `rms_norm`, выделенный
+`torch.empty` (`kernels/rmsnorm.py:113`). Норма не возвращает offset view,
+output contiguous, обычная CUDA allocator аллокация имеет достаточное
+выравнивание. Таким образом, при aligned исходном x actual output не становится
+misaligned; при misaligned исходном x preflight консервативно оставляет fp32.
+Обычного воспроизводимого случая readiness=True → actual=False именно из-за
+alignment/layout/dtype не найдено. Shape, device, autocast и статические module
+flags в штатной последовательности также не меняются между проверками.
+
+Если **принудительно** изменить состояние/forward или eligibility после
+preflight, actual `_eligible=False` вызывает original PEFT с уже fp16 tensor
+(`lora.py:110`–`:111`). Защитного восстановления fp32 для этой ветки нет, так
+что original dropout тогда получает half. Это условный результат чтения кода,
+а не найденная гонка штатного task; concurrent module mutation, custom norm
+instance forward или намеренно изменяющие output обёртки не покрыты доказанной
+готовностью. Нельзя заявлять защиту от любого последующего отказа. Существующий
+тест отклоняет `_eligible` **одновременно** для preflight и actual, поэтому
+проверяет ранний отказ, а не такой изменившийся во времени случай.
+
+Во время обычного forward между preflight и q/v не добавлен RNG-вызов.
+При принятом fast path `x.float()` даёт aligned contiguous fp32 input Dropout
+того же размера; маска и продвижение RNG проверяются отдельным GPU-test.
+До выполнения test на T4 это остаётся проверенной структурой, не новым логом.
+
+### 2. ContextVar ownership, исключения, backward и eval/generation
+
+`_half_norm_scope:30` сохраняет token и выполняет reset в `finally`.
+Scope содержит **identity одного norm instance**, а не class/global bool.
+Внешний final-norm scope охватывает decoder forward; внутренний input-norm
+scope временно заменяет owner и затем восстанавливает final owner. Так final
+scope не превращает все input/post norms в half. Для неподходящего пути scope
+устанавливает None и после возврата восстанавливает предыдущий контекст.
+
+Локально без torch/pytest исполнен AST **точной функции из 3c560d1**: вложенный
+scope, ValueError во внутреннем scope, восстановление внешнего owner и reset
+к None после выхода — **PASS**. Production-файлы не менялись.
+
+Ни backward RMSNorm, ни add+RMSNorm, ни CE не читают `_HALF_NORM`; precision
+решается в forward, backward использует saved tensors и ctx.exact_dtype.
+Глобальной утечки scope в следующий batch или backward не найдено.
+
+Eval/no-label/generation head уходит в original, но final scope может быть
+включён в CUDA fp16 autocast, если plain head и остальные guards подходят.
+Input norm scope также не ограничен training; без AMP он выключен, с AMP
+может работать. LoRA Dropout в eval не бросает случайные элементы. Generation
+cache/attention kwargs передаются прежним способом, output_hidden_states
+отключает input/final compression. Это не обещание неизменности всех outputs:
+слойные precision оптимизации остаются активны и имеют P1-023-1 boundary.
+
+### 3. NF4 post-import callbacks — порядок, already-loaded, idempotence, фейки
+
+Использованы те же verified wheel sources 0.50.2 из S-021; дополнительно
+из wheel вне repo извлечён `bitsandbytes/__init__.py`.
+Root импортирует autograd/nn и CUDA ops (при CUDA available), а
+`__version__='0.50.2'` устанавливает только в конце (`:78`).
+
+`_NF4_MODULES` содержит root, functional и cuda ops. Callback требует все три
+реальных ModuleType и отказывает, пока **другой** module ещё initializing
+(`patch.py:402`–`:415`). Текущий callback исключён из проверки: underlying
+exec_module уже завершился, хотя Python ещё не сбросил его spec flag.
+
+Для обычного `import bitsandbytes` после apply functional/backend callbacks
+не ставят patch, пока root инициализируется. Root callback после своего
+exec_module видит готовые children и уже заданный __version__, поэтому вызывает
+installer без преждевременного circular import. При поздней загрузке cuda ops
+его callback допускается, когда root/functional закончены. Внутренние
+importlib.import_module installer получают уже имеющиеся объекты; новый
+неготовый пакет не импортируется ради регистрации.
+
+`install:459` обрабатывает и модули, загруженные **до** apply; порядок обхода set
+не существенен, если они полностью загружены. Повторный installer сохраняет
+обёртки через markers на обеих функциях. Сам finder устанавливается один раз.
+Фейки SimpleNamespace/модули без package root отсекаются раньше; missing
+functional/backend callable тоже не вызывают installer. Точный version gate
+0.50.2 остаётся в `nf4_patch.py`.
+
+Локально исполнен AST точного `_register_module` с metadata modules и spy
+installer (не с torch/bnb runtime): missing backend → skip, root initializing
+при callback backend → skip, root final callback → install, повторные callbacks
+already-loaded modules → без повторного изменения spy wrappers, fake root → skip:
+**PASS**. Spy доказывает scheduling, а не numerical correctness NF4.
+Реальный pinned CUDA import и оба patched function markers проверяет добавленный
+`test_nf4_hooks_registered_after_bnb_import`; его GPU-результат здесь UNVERIFIED.
+Предыдущий вывод S-021 «NF4 installer не вызывается default apply» для этого
+нового коммита **устарел**: 3c560d1 явно добавляет регистрацию.
+
+### 4. RMSNorm out_dtype backward — исходный promote dtype сохранён
+
+Forward сохраняет `ctx.exact_dtype = promote_types(x.dtype, weight.dtype)`
+**до** optional final fp16 output store. Нормализованное q приводится к x.dtype
+перед weight multiply, как раньше; out_dtype меняет только конечный store.
+
+В input backward upstream half загружается как fp32, что соответствует обратному
+cast half→исходный promoted dtype; `u=g*weight` затем приводится к x.dtype до
+Jacobian. dx allocation остаётся x.dtype. Нет зависимости от активного scope
+или forward autocast в момент backward.
+
+В dgamma `OUT_HALF` теперь выбирается по **ctx.exact_dtype**, а не grad.dtype
+(`rmsnorm.py:148`–`:154`). При x fp16/weight fp32 итог до optional cast был fp32:
+промежуточный g*q поэтому не должен округляться в half. При x/weight обоих
+fp16 exact output half и этот product cast нужен. Приведение final dw к
+weight.dtype остаётся прежним. Ошибки этой dtype-логики не найдено.
+
+Добавленные tests покрывают четыре пары dtype и frozen/trainable gamma,
+comparison с exact-output.half, Qwen reference и variant counts по длинам.
+Сравнение exact.half использует тот же kernel и не является независимым oracle
+редукции; дополнительно есть независимая формула и отдельный fixed-row bitwise
+Qwen reference. GPU execution локально не выполнялся.
+
+### 5. P1-2: логический путь теста без AMP
+
+В `test_bridge_without_amp_preserves_dense_fallback` модель содержит обычные
+fp32 nn.Linear, CUDA autocast выключен. `_input_norm_half_ready` и
+`_final_norm_half_ready` сразу возвращают False. Для post norm
+`_plain_half_consumer(nn.Linear, x)` возвращает False без CUDA fp16 autocast,
+поэтому `decoder.py:82` передаёт out_dtype=None. Норма возвращает fp32;
+MLP original получает fp32 и не повторяет прежний Half != float crash.
+Head по-прежнему возвращает logits в dense fallback и метрики через bridge.
+
+Локальный metadata probe точных функций `_post_norm_half_ready` и
+`_plain_half_consumer` из коммита: dense no-AMP reject, тот же dense AMP accept,
+добавленный projection prehook reject — **PASS**. Это проверка guards без
+GPU, не ложное заявление о pytest pass. P1-2 **закрыт статически**, а повторный
+реальный regression test — обязательное оставшееся подтверждение.
+
+### Предложенные проверки на T4 (не запускались)
+
+```bash
+python -m pytest solution/tests/test_integration.py -q
+python -m pytest solution/tests/test_rmsnorm.py -q
+python -m pytest solution/tests/test_nf4.py -q
+SOUP_APPLY_SOLUTION=1 python -m pytest tests -q
+python harness/run_task.py --repeats 2 --out runs_s023
+python harness/check_rules.py --result runs_s023/result.json
+```
+
+Отдельно изолировать input/final compression для оценки P1-023-1; сравнить
+RNG, значения после dropout перед A, gradients перед RMSNorm и adapter
+updates при nonzero B/нескольких seed. Проверить NF4 functional/backend markers
+после cold import и already-loaded apply. Значения скорости/памяти/quality
+коммита de836e0 не переносятся на этот новый default автоматически.
