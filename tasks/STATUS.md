@@ -22,3 +22,6 @@
 | solution default | 0e12e01 | — | 89.81 s / 8003 MiB / 2.04967, share 3.63%, median 0.82 s | другая машина |
 | solution `SOUP_FUSED_NORM_FP16=1` | 0e12e01 | — | 76.64 s / 5843 MiB / 2.04966, share 3.96%, median 0.72 s | → сделано по умолчанию в b3a3432 |
 | **full ×1** | **de836e0** | 77.47 s / 14345 MiB / 2.04964 | **70.05 s / 5843 MiB / 2.04962** | **10/10 PASS**; speedup 1.106, memory 2.455, share 8.6% |
+| **full ×1** | **ce1ff09** | 82.25 s / 14345 MiB / 2.0496 | **73.54 s / 5863 MiB / 2.04969** | **10/10 PASS**; speedup 1.118, memory 2.447, share 12.1% (NF4 включён); pytest solution 214 passed / 4 failed (тесты устарели, см. S-022) |
+| solution MLP store | 8f8ebbc | — | 79.57 s / 5843 MiB / 2.04966, loop 47.05 s | |
+| solution MLP recompute | 8f8ebbc | — | 86.39 s / 4143 MiB / 2.04966, loop 53.63 s | |
