@@ -12,6 +12,25 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a C
 TOLERANCE = dict(rtol=2e-3, atol=2e-3)
 
 
+@pytest.fixture(autouse=True)
+def explicit_mode_environment(monkeypatch):
+    for key in ("SOUP_MLP_OFFLOAD", "SOUP_MLP_RECOMPUTE", "SOUP_MLP_RECOMPUTE_LAYERS"):
+        monkeypatch.delenv(key, raising=False)
+
+
+@pytest.fixture
+def offload_runtime(monkeypatch):
+    import solution.mlp as runtime
+
+    monkeypatch.setattr(runtime, "_OFFLOAD_POOLS", {})
+    monkeypatch.setattr(runtime, "_RETIRED_POOLS", [])
+    monkeypatch.setattr(runtime, "_LAYER_ORDERS", {})
+    yield runtime
+    # Tests may discard a whole pool; production uses events and never does this.
+    torch.cuda.synchronize()
+    gc.collect()
+
+
 class FrozenMLP(torch.nn.Module):
     def __init__(self, hidden=64, intermediate=1001, dtype=torch.float16, bnb=False):
         super().__init__()
@@ -200,3 +219,174 @@ def test_unsupported_projections_refused_and_patch_falls_back(monkeypatch):
     assert patch_qwen2_mlp_fused() and Qwen2MLP.forward is patched
     values = x.float()
     torch.testing.assert_close(layer(values), original(layer, values))
+
+
+@pytest.mark.parametrize("amp", [False, True])
+@pytest.mark.parametrize("bnb", [False, True])
+def test_offload_matches_store_bits_and_retained_backward(offload_runtime, amp, bnb):
+    runtime = offload_runtime
+    torch.manual_seed(231)
+    layer = FrozenMLP(dtype=torch.float32 if amp else torch.float16,
+                      intermediate=256 if bnb else 1001, bnb=bnb)
+    runtime.prepare_mlp_offload(layer, max_rows=231)
+    dtype = torch.float32 if amp else torch.float16
+    x = torch.randn((3, 77, 64), device="cuda", dtype=dtype, requires_grad=True)
+    other = x.detach().clone().requires_grad_()
+    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp):
+        expected = runtime.fused_qwen2_mlp(layer, x, recompute=False, offload=False)
+        actual = runtime.fused_qwen2_mlp(layer, other, recompute=False, offload=True)
+    assert torch.equal(actual, expected)
+    upstream = torch.randn_like(actual)
+    expected.backward(upstream)
+    actual.backward(upstream, retain_graph=True)
+    assert torch.equal(other.grad, x.grad)
+    pool = next(iter(runtime._OFFLOAD_POOLS.values()))
+    assert any(slot.leased for slot in pool.host)
+    other.grad = None
+    actual.backward(upstream)
+    assert torch.equal(other.grad, x.grad)
+    assert not any(slot.leased for slot in pool.host)
+    assert len(pool.staging) == 2
+
+
+def test_offload_reuses_pinned_buffers_across_different_lengths(offload_runtime):
+    runtime = offload_runtime
+    layer = FrozenMLP(intermediate=1001)
+    runtime.prepare_mlp_offload(layer, max_rows=4 * 257)
+    pool = next(iter(runtime._OFFLOAD_POOLS.values()))
+    pointers = [(s.gate.data_ptr(), s.up.data_ptr()) for s in pool.host]
+    allocations = pool.host_allocations
+    for sequence in (17, 257, 32, 128, 77, 17):
+        x = torch.randn((4, sequence, 64), device="cuda", dtype=torch.float16, requires_grad=True)
+        other = x.detach().clone().requires_grad_()
+        expected = runtime.fused_qwen2_mlp(layer, x, recompute=False, offload=False)
+        actual = runtime.fused_qwen2_mlp(layer, other, recompute=False, offload=True)
+        upstream = torch.randn_like(actual)
+        expected.backward(upstream)
+        actual.backward(upstream)
+        assert torch.equal(actual, expected) and torch.equal(other.grad, x.grad)
+        assert not any(slot.leased for slot in pool.host)
+        assert pool.host_allocations == allocations
+        assert [(s.gate.data_ptr(), s.up.data_ptr()) for s in pool.host] == pointers
+    assert len(pool.staging) == 2
+
+
+@pytest.mark.parametrize("count", [0, 1, 2, 4])
+@pytest.mark.parametrize("offload", [False, True])
+def test_partial_recompute_exact_layer_count_and_gradients(offload_runtime, monkeypatch, count, offload):
+    runtime = offload_runtime
+    torch.manual_seed(232)
+    layers = torch.nn.ModuleList([FrozenMLP(intermediate=256) for _ in range(4)])
+    shared = SimpleNamespace(hidden_act="silu", num_hidden_layers=4)
+    for layer in layers:
+        layer.config = shared
+    x = torch.randn((2, 5, 64), device="cuda", dtype=torch.float16, requires_grad=True)
+    other = x.detach().clone().requires_grad_()
+    expected = x
+    for layer in layers:
+        expected = expected + runtime.fused_qwen2_mlp(layer, expected, recompute=False, offload=False)
+    upstream = torch.randn_like(expected)
+    expected.backward(upstream)
+    calls = []
+    original_linear = F.linear
+
+    def counted(*args, **kwargs):
+        calls.append(args[1].data_ptr())
+        return original_linear(*args, **kwargs)
+
+    monkeypatch.setenv("SOUP_MLP_RECOMPUTE_LAYERS", str(count))
+    monkeypatch.setenv("SOUP_MLP_OFFLOAD", "1" if offload else "0")
+    monkeypatch.setattr(F, "linear", counted)
+    actual = other
+    for layer in layers:
+        actual = actual + runtime.fused_qwen2_mlp(layer, actual)
+    actual.backward(upstream)
+    torch.testing.assert_close(actual, expected, **TOLERANCE)
+    torch.testing.assert_close(other.grad, x.grad, **TOLERANCE)
+    assert len(calls) == 3 * len(layers) + 2 * count
+    assert bool(runtime._OFFLOAD_POOLS) == (offload and count < len(layers))
+
+
+def test_offload_prefetch_and_multilayer_peak(offload_runtime):
+    runtime = offload_runtime
+    torch.manual_seed(233)
+    layers = torch.nn.ModuleList([FrozenMLP(intermediate=4096) for _ in range(8)])
+    runtime.prepare_mlp_offload(layers, max_rows=512)
+    pool = next(iter(runtime._OFFLOAD_POOLS.values()))
+    pinned_allocations = pool.host_allocations
+    staging_bytes = 2 * (pool.upload_gate.numel() + pool.upload_up.numel())
+    staging_bytes += sum(2 * (s.gate.numel() + s.up.numel()) for s in pool.staging)
+    warm = torch.randn((4, 128, 64), device="cuda", dtype=torch.float16, requires_grad=True)
+    for recompute, offload in ((False, False), (True, False), (False, True)):
+        runtime.fused_qwen2_mlp(layers[0], warm, recompute, offload).sum().backward()
+    del warm
+
+    def measure(recompute, offload):
+        gc.collect()
+        x = torch.randn((4, 128, 64), device="cuda", dtype=torch.float16, requires_grad=True)
+        torch.cuda.synchronize()
+        baseline = torch.cuda.memory_allocated()
+        # Pools were prewarmed for all modes; count their FULL CUDA reservation
+        # in offload's peak, rather than hiding persistent staging in baseline.
+        if offload:
+            baseline -= staging_bytes
+        torch.cuda.reset_peak_memory_stats()
+        out = x
+        for layer in layers:
+            out = out + runtime.fused_qwen2_mlp(layer, out, recompute, offload)
+        out.sum().backward()
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() - baseline
+        del out, x
+        gc.collect()
+        return peak
+
+    store = measure(False, False)
+    recompute = measure(True, False)
+    offload = measure(False, True)
+    print(f"MLP peaks bytes: store={store}, recompute={recompute}, offload={offload}; "
+          f"offload CUDA window={staging_bytes}")
+    assert offload < 0.75 * store
+    # Offload keeps a bounded DMA window instead of per-layer saved tensors.
+    # The fixed window is relatively large for tiny H=64; include it explicitly.
+    assert offload <= recompute + staging_bytes + 2 * 1024**2
+    assert pool.prefetches >= len(layers)
+    assert pool.host_allocations == pinned_allocations
+    assert not any(slot.leased for slot in pool.host)
+    assert len(pool.staging) == 2
+
+
+def test_offload_environment_opt_in_preserves_default_store(offload_runtime, monkeypatch):
+    runtime = offload_runtime
+    layer = FrozenMLP(intermediate=256)
+    x = torch.randn((2, 5, 64), device="cuda", dtype=torch.float16, requires_grad=True)
+    runtime.fused_qwen2_mlp(layer, x).sum().backward()
+    assert not runtime._OFFLOAD_POOLS
+    monkeypatch.setenv("SOUP_MLP_OFFLOAD", "1")
+    monkeypatch.setenv("SOUP_MLP_RECOMPUTE", "1")
+    x.grad = None
+    runtime.fused_qwen2_mlp(layer, x).sum().backward()
+    assert not runtime._OFFLOAD_POOLS  # full recompute takes precedence
+    monkeypatch.delenv("SOUP_MLP_RECOMPUTE")
+    x.grad = None
+    runtime.fused_qwen2_mlp(layer, x).sum().backward()
+    assert runtime._OFFLOAD_POOLS
+
+
+def test_offload_cross_stream_producer_and_consumer(offload_runtime):
+    runtime = offload_runtime
+    layer = FrozenMLP(intermediate=1001)
+    runtime.prepare_mlp_offload(layer, max_rows=231)
+    x = torch.randn((3, 77, 64), device="cuda", dtype=torch.float16, requires_grad=True)
+    other = x.detach().clone().requires_grad_()
+    reference = runtime.fused_qwen2_mlp(layer, x, False, False)
+    upstream = torch.randn_like(reference)
+    reference.backward(upstream)
+    producer = torch.cuda.Stream()
+    producer.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(producer):
+        actual = runtime.fused_qwen2_mlp(layer, other, False, True)
+        actual.backward(upstream)
+    torch.cuda.current_stream().wait_stream(producer)
+    assert torch.equal(actual, reference)
+    assert torch.equal(other.grad, x.grad)
