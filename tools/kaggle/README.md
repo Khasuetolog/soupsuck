@@ -24,11 +24,25 @@ python3 tools/kaggle/run.py run --mode unit
 python3 tools/kaggle/run.py run --mode solution
 python3 tools/kaggle/run.py run --mode full
 python3 tools/kaggle/run.py run --mode full2
+# Отдельный эксперимент, не настройки финального прогона жюри:
+python3 tools/kaggle/run.py run --mode solution --env SOUP_FUSED_NORM_FP16=1 --tag norm16
 ```
 
 По умолчанию `KAGGLE_BIN=kaggle`. Dry-run никогда не вызывает CLI, не требует
 токена и оставляет собранный notebook/metadata во временном каталоге; без
 username использует `dry-run-user`. Для запуска нужен настоящий username.
+
+`--env SOUP_KEY=VALUE` можно повторять; при повторе ключа берётся последнее
+значение. Разрешены только `SOUP_`-ключи, кроме `SOUP_APPLY_SOLUTION`: этот ключ
+остаётся под управлением шага pytest. Значения передаются как строки без shell
+интерпретации и устанавливаются в notebook до запуска дочерних процессов;
+`harness.common.ENV` наследует их. Флаги и tag видны в notebook, `experiment.json`,
+`launch.json`, `out/status.json` и сводке; dry-run показывает их без запуска CLI.
+Набор флагов получает стабильный короткий хеш, независимый от порядка аргументов,
+в slug и имени каталога. Без флагов/тега прежние имена сохраняются.
+`--tag` принимает до 32 ASCII-букв, цифр, `_` или `-`; переводится в нижний регистр,
+`_` заменяется на `-`. Полный tag сохраняется в каталоге и metadata эксперимента,
+а slug содержит первые 10 символов, чтобы ограничить общую длину имени ядра.
 
 `push-code` отправляет **только закоммиченный HEAD** через `git archive` и печатает
 полный SHA. При грязном checkout выводится предупреждение; незакоммиченные
@@ -78,8 +92,10 @@ train-логи также сохраняются. После сбора notebook
 данные и веса адаптеров, чтобы они не раздували экспорт; evidence остаётся в out.
 
 На экране — wall time, GPU peak, eval loss и ratios из result, PASS/FAIL каждого
-check, `own_kernel_ms` и доля `sum(own_kernel_ms)/(1000*timed_loop_s)`, хвосты
-pytest и notebook status. Авторитетная проверка засчитываемой доли собственных
+check, `own_kernel_ms` без `example_*` и доля суммы этих ядер от
+`1000*timed_loop_s`, top-15 ядер каждого `profile.json` по GPU-времени
+(миллисекунды, доля GPU-времени, число вызовов), хвосты pytest и notebook status.
+Авторитетная проверка засчитываемой доли собственных
 ядер — check 4, поскольку он дополнительно исключает сходство с примером.
 Режим `solution` не запускает checks/score: сравнение с base требует `full`.
 
