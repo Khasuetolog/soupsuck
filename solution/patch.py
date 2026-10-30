@@ -250,8 +250,10 @@ def install():
     _patch_head(qwen.Qwen2ForCausalLM)
     _patch_norm(qwen.Qwen2RMSNorm)
     from .decoder import patch_qwen2_decoder
+    from .lora import patch_lora_4bit
 
     patch_qwen2_decoder()
+    patch_lora_4bit()
     # Preserve the supplied example, guarding its registration externally.
     mlp = qwen.Qwen2MLP
     if not hasattr(mlp.forward, _MARKER):
