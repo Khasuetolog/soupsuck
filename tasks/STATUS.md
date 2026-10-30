@@ -25,3 +25,4 @@
 | **full ×1** | **ce1ff09** | 82.25 s / 14345 MiB / 2.0496 | **73.54 s / 5863 MiB / 2.04969** | **10/10 PASS**; speedup 1.118, memory 2.447, share 12.1% (NF4 включён); pytest solution 214 passed / 4 failed (тесты устарели, см. S-022) |
 | solution MLP store | 8f8ebbc | — | 79.57 s / 5843 MiB / 2.04966, loop 47.05 s | |
 | solution MLP recompute | 8f8ebbc | — | 86.39 s / 4143 MiB / 2.04966, loop 53.63 s | |
+| full ×1 `SOUP_MLP_RECOMPUTE=1` | ce1ff09 | 97.75 s / 14345 MiB / 2.04964 | 93.95 s / 4123 MiB / 2.04968 | 10/10 PASS; speedup **1.040 (<1.05 = 0 баллов скорости)**, memory 3.479, share 10.6% → дефолт остаётся store |
