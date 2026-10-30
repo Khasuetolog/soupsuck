@@ -94,13 +94,48 @@ def test_arbitrary_leading_shapes(shape):
     _check(x, weight)
 
 
-def test_strided_leading_dimensions_without_input_copy():
+def test_runtime_strided_2d_rows_without_input_copy():
     torch.manual_seed(321)
-    x = torch.randn((3, 4, 1000), device="cuda").transpose(0, 1).detach().requires_grad_()
+    x = torch.randn((12, 1000), device="cuda")[::2].detach().requires_grad_()
     weight = torch.randn(2000, device="cuda")[::2].detach().requires_grad_()
     assert x.stride(-1) == 1 and not x.is_contiguous()
     assert weight.stride(0) == 2
     _check(x, weight)
+
+
+def test_changing_sequence_length_reuses_compiled_variants():
+    from solution.kernels import rms_norm
+    from solution.kernels.rmsnorm import (
+        rmsnorm_forward_kernel,
+        rmsnorm_input_gradient_kernel,
+        rmsnorm_weight_partials_kernel,
+        rmsnorm_weight_finalize_kernel,
+    )
+
+    # Verified against Triton v3.6.0 runtime/jit.py: create_binder returns
+    # (kernel_cache, key_cache, target, backend, binder), stored per device.
+    # https://github.com/triton-lang/triton/blob/v3.6.0/python/triton/runtime/jit.py
+    device = torch.cuda.current_device()
+    kernels = (rmsnorm_forward_kernel, rmsnorm_input_gradient_kernel,
+               rmsnorm_weight_partials_kernel, rmsnorm_weight_finalize_kernel)
+
+    def variant_count(kernel):
+        entry = kernel.device_caches.get(device)
+        return len(entry[0]) if entry is not None else 0
+
+    before = {kernel.__name__: variant_count(kernel) for kernel in kernels}
+    weight = torch.ones(1536, device="cuda", requires_grad=True)
+    for sequence in (17, 32, 77, 128, 257):
+        x = torch.randn((4, sequence, 1536), device="cuda", requires_grad=True)
+        # Random dense upstream keeps its stride specialization the same.
+        out = rms_norm(x, weight, 2e-5)
+        out.backward(torch.randn_like(out))
+        weight.grad = None
+    torch.cuda.synchronize()
+    for kernel in kernels:
+        growth = variant_count(kernel) - before[kernel.__name__]
+        # Runtime integer alignment may produce divisible-by-16 and generic variants.
+        assert growth <= 2, f"{kernel.__name__} compiled {growth} variants for five S values"
 
 
 def test_broadcast_upstream_and_weight_gradient_only():
@@ -143,3 +178,6 @@ def test_invalid_layout_and_cpu_raise_value_error():
     x = torch.randn((2, 5, 1000), device="cuda")[..., ::2]
     with pytest.raises(ValueError, match="contiguous"):
         rms_norm(x, torch.ones(500, device="cuda"), 1e-6)
+    leading = torch.randn((3, 4, 1000), device="cuda").transpose(0, 1)
+    with pytest.raises(ValueError, match="2-D"):
+        rms_norm(leading, torch.ones(1000, device="cuda"), 1e-6)
