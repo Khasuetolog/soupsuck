@@ -20,6 +20,11 @@ import tempfile
 import time
 import zipfile
 
+if __package__:
+    from . import registry
+else:
+    import registry
+
 ROOT = Path(__file__).resolve().parents[2]
 DATASET_SLUG = "soup-kernel-code"
 POLL_SECONDS = 30
@@ -140,7 +145,7 @@ def env_hash(environment):
     return hashlib.sha256(json.dumps(environment, sort_keys=True).encode()).hexdigest()[:6] if environment else ""
 
 
-def build_kernel(mode, user, sha, environment=None, tag=""):
+def build_kernel(mode, user, sha, environment=None, tag="", variants=None, rounds=4):
     environment = dict(environment or {})
     directory = Path(tempfile.mkdtemp(prefix="soup-kaggle-kernel-"))
     # Unique slug prevents an overlapping/latest-version run from supplying
@@ -165,11 +170,14 @@ def build_kernel(mode, user, sha, environment=None, tag=""):
         f"MODE = {mode!r}\n", f"EXPECTED_SHA = {sha!r}\n",
         f"DATASET = {metadata['dataset_sources'][0]!r}\n",
         f"EXPERIMENT_ENV = {environment!r}\n", f"RUN_TAG = {tag!r}\n",
+        f"AB_VARIANTS = {variants!r}\n", f"AB_ROUNDS = {rounds!r}\n",
+        f"SESSION_ID = {metadata['id']!r}\n",
     ]
     write_json(directory / "iterate.ipynb", notebook)
     write_json(directory / "kernel-metadata.json", metadata)
-    if environment or tag:
-        write_json(directory / "experiment.json", {"env": environment, "env_hash": env_hash(environment), "tag": tag})
+    if environment or tag or mode == "ab":
+        write_json(directory / "experiment.json", {"env": environment, "env_hash": env_hash(environment), "tag": tag,
+                                                   "variants": variants, "rounds": rounds if mode == "ab" else None})
     return directory, metadata
 
 
@@ -246,9 +254,23 @@ def summarize(directory):
 
 def run(args):
     environment = dict(args.env)
+    if args.mode == "ab":
+        if environment:
+            raise ValueError("ab uses --variants only; --env would change the unchanged control A")
+        if not args.variants:
+            raise ValueError("ab requires --variants 'A=;B=SOUP_EXP_NAME=1'")
+        registry.parse_variants(args.variants)
+        if args.rounds is not None and args.rounds < 1:
+            raise ValueError("--rounds must be positive")
+    elif args.variants is not None or args.rounds is not None:
+        raise ValueError("--variants and --rounds apply only to --mode ab")
     user, sha = username(args.dry_run), commit()
-    directory, metadata = build_kernel(args.mode, user, sha, environment, args.tag)
+    directory, metadata = build_kernel(args.mode, user, sha, environment, args.tag,
+                                       variants=args.variants, rounds=args.rounds or 4)
     print("Kernel directory:", directory)
+    if args.mode == "ab":
+        variants = registry.parse_variants(args.variants)
+        print("A/B plan:", json.dumps(list(registry.schedule(variants, args.rounds or 4)), sort_keys=True))
     if environment or args.tag:
         print("Experiment env:", json.dumps(environment, sort_keys=True), "tag:", args.tag)
     if args.dry_run:
@@ -261,7 +283,8 @@ def run(args):
     output.mkdir(parents=True)
     shutil.copytree(directory, output / "submitted")
     write_json(output / "launch.json", {"commit": sha, "kernel": metadata["id"], "mode": args.mode,
-                                        "env": environment, "tag": args.tag})
+                                        "env": environment, "tag": args.tag, "variants": args.variants,
+                                        "rounds": (args.rounds or 4) if args.mode == "ab" else None})
     kaggle("kernels", "push", "-p", directory, "--accelerator", "NvidiaTeslaT4",
            "--timeout", str(TIMEOUT_SECONDS))
     deadline = time.monotonic() + TIMEOUT_SECONDS
@@ -283,6 +306,24 @@ def run(args):
         write_json(output / "download-status.json", {"exit_code": downloaded.returncode,
                                                    "remote_status": status})
         ok = summarize(output)
+        if args.mode == "ab":
+            source = output / "out" / "experiments" / "registry.jsonl"
+            if source.exists():
+                rows = registry.read_rows(source)
+                if any(row["commit"] != sha or row["session"] != metadata["id"] for row in rows):
+                    print("A/B registry from another commit/session; import refused", file=sys.stderr)
+                    ok = False
+                else:
+                    count = registry.import_registry(source, ROOT / "experiments/registry.jsonl")
+                    print("A/B registry rows collected:", count)
+                    registry.aggregate(ROOT / "experiments/registry.jsonl", ROOT / "experiments/results.csv")
+                    expected = 1 + len(registry.parse_variants(args.variants)) * (args.rounds or 4)
+                    if count != expected or any(not row["ok"] for row in rows):
+                        print("A/B registry incomplete or contains failed attempts", file=sys.stderr)
+                        ok = False
+            else:
+                print("A/B registry missing; inspect notebook/ab logs", file=sys.stderr)
+                ok = False
         print("Artifacts:", output)
     return 0 if status in {"complete", "completed"} and downloaded.returncode == 0 and ok else 1
 
@@ -293,11 +334,13 @@ def main():
     push = commands.add_parser("push-code", help="Publish committed HEAD as a private Kaggle dataset")
     push.set_defaults(handler=push_code)
     launch = commands.add_parser("run", help="Run a private T4 notebook and download its outputs")
-    launch.add_argument("--mode", choices=("unit", "solution", "full", "full2", "probe", "bench"), required=True)
+    launch.add_argument("--mode", choices=("unit", "solution", "full", "full2", "probe", "bench", "ab"), required=True)
     launch.add_argument("--dry-run", action="store_true", help="Build notebook/metadata without invoking Kaggle")
     launch.add_argument("--env", action="append", type=env_pair, default=[], metavar="SOUP_KEY=VALUE",
                         help="Experiment flag (repeatable); SOUP_APPLY_SOLUTION is reserved")
     launch.add_argument("--tag", type=experiment_tag, default="", help="Run label for kernel slug and output directory")
+    launch.add_argument("--variants", help="ab only: A=;B=SOUP_EXP_NAME=1;C=SOUP_EXP_OTHER=1")
+    launch.add_argument("--rounds", type=int, help="ab only: paired rounds (default 4; use an even count)")
     launch.set_defaults(handler=run)
     args = parser.parse_args()
     try:
