@@ -158,6 +158,148 @@ def test_real_vocabulary_and_mean_sized_upstream(weight_dtype):
     _compare(x, w, y, upstream)
 
 
+@pytest.mark.parametrize("reduced_precision", [False, True])
+def test_fp16_logits_and_online_metrics_match_linear_bitwise(monkeypatch, reduced_precision):
+    from solution.kernels import cross_entropy as ce
+
+    previous = torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = reduced_precision
+    try:
+        x, w, y = _inputs(77, 1536, 4103, torch.float32, hidden_dtype=torch.float32)
+        h16 = x.detach().half()
+        n, v = y.numel(), w.shape[0]
+        state = torch.empty((n, 4), device="cuda", dtype=torch.float32)
+        expected_best = torch.empty(n, device="cuda", dtype=torch.int64)
+        expected_loss, expected_entropy, expected_lse = (
+            torch.empty(n, device="cuda", dtype=torch.float32) for _ in range(3))
+        original_mm = torch.mm
+        old_path_differences = 0
+        # The oracle changes only GEMM to native F.linear. Online reductions
+        # differ from torch.logsumexp's tree, so those existing tests keep their
+        # fixed tolerances; identical GEMM paths must give identical online bits.
+        for start in range(0, v, 4096):
+            w16 = w[start:start + 4096].half().contiguous()
+            logits = F.linear(h16, w16)
+            old_rounded = original_mm(h16, w16.t(), out_dtype=torch.float32).half()
+            old_path_differences += (logits.view(torch.int16) != old_rounded.view(torch.int16)).sum().item()
+            width = logits.shape[1]
+            ce.vocabulary_statistics_kernel[(n,)](
+                logits, y, state, expected_best, width, start, IGNORE=-100,
+                FIRST=start == 0, BLOCK=ce.triton.next_power_of_2(width), num_warps=4)
+        ce.vocabulary_outputs_kernel[(ce.triton.cdiv(n, 256),)](
+            state, y, expected_loss, expected_entropy, expected_lse, n, IGNORE=-100, BLOCK=256)
+        observed = []
+
+        def checked_mm(a, b, *args, **kwargs):
+            result = original_mm(a, b, *args, **kwargs)
+            assert result.dtype == torch.float16
+            native = F.linear(a, b.t())
+            assert torch.equal(result.view(torch.int16), native.view(torch.int16))
+            observed.append(result.shape)
+            return result
+
+        with monkeypatch.context() as patch:
+            patch.setattr(torch, "mm", checked_mm)
+            actual = ce.fused_linear_cross_entropy(x, w, y)
+        assert len(observed) == 2  # one full vocabulary tile and its tail
+        for result, expected in zip(actual, (expected_loss, expected_entropy, expected_best, expected_lse)):
+            if result.dtype == torch.int64:
+                assert torch.equal(result, expected)
+            else:
+                assert torch.equal(result.view(torch.int32), expected.view(torch.int32))
+        print(f"reduced_precision={reduced_precision}: old fp32-out rounded logits differ "
+              f"in {old_path_differences} elements; fp16 mm/F.linear bits match")
+    finally:
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = previous
+
+
+@pytest.mark.parametrize("ignored", ["none", "some", "all"])
+def test_backward_compacts_exactly_the_valid_rows(monkeypatch, ignored):
+    from solution.kernels import fused_linear_cross_entropy
+
+    x, w, y = _inputs(77, 64, 4103, torch.float32, ignored, hidden_dtype=torch.float32)
+    outputs = fused_linear_cross_entropy(x, w, y)
+    upstream = torch.randn(77, device="cuda")
+    _, _, _, _, _, ideal = _reference(x, w, y, upstream)
+    valid_n = (y != -100).sum().item()
+    original_mm = torch.mm
+    calls = []
+
+    def checked_mm(a, b, *args, **kwargs):
+        assert a.shape[0] == valid_n, "backward GEMM includes ignored rows"
+        result = original_mm(a, b, *args, **kwargs)
+        calls.append((a.shape, result.dtype))
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "mm", checked_mm)
+        outputs[0].backward(upstream)
+    assert len(calls) == (4 if valid_n else 0)  # two GEMMs per vocabulary chunk
+    if valid_n:
+        assert [dtype for _, dtype in calls] == [torch.float16, torch.float32] * 2
+    assert torch.count_nonzero(x.grad[y == -100]).item() == 0
+    error = (x.grad - ideal).norm().item()
+    assert error <= GRAD_RTOL * ideal.norm().item()
+    # Metrics for ignored rows must still be the same as an all-valid forward.
+    all_valid = y.clone()
+    all_valid[y == -100] = 0
+    valid_outputs = fused_linear_cross_entropy(x, w, all_valid)
+    for result, expected in zip(outputs[1:], valid_outputs[1:]):
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("nonfinite", [float("inf"), -float("inf"), float("nan"),
+                                     torch.finfo(torch.float32).max])
+def test_all_ignored_nonfinite_or_huge_upstream_still_has_zero_gradient(nonfinite):
+    from solution.kernels import fused_linear_cross_entropy
+
+    x, w, y = _inputs(6, 32, 1000, torch.float32, "all", hidden_dtype=torch.float32)
+    loss = fused_linear_cross_entropy(x, w, y)[0]
+    loss.backward(torch.full_like(loss, nonfinite))
+    assert torch.isfinite(x.grad).all()
+    assert torch.count_nonzero(x.grad).item() == 0
+
+
+def test_one_ignored_row_with_infinite_upstream_cannot_poison_valid_gradients():
+    from solution.kernels import fused_linear_cross_entropy
+
+    x, w, y = _inputs(6, 32, 1000, torch.float32, "none", hidden_dtype=torch.float32)
+    y[2] = -100
+    upstream = torch.randn(6, device="cuda")
+    safe_upstream = upstream.clone()
+    safe_upstream[2] = 0
+    _, _, _, _, _, ideal = _reference(x, w, y, safe_upstream)
+    upstream[2] = float("inf")
+    fused_linear_cross_entropy(x, w, y)[0].backward(upstream)
+    assert torch.isfinite(x.grad).all()
+    assert torch.count_nonzero(x.grad[2]).item() == 0
+    assert (x.grad - ideal).norm().item() <= GRAD_RTOL * ideal.norm().item()
+
+
+@pytest.mark.parametrize("denominator", ["derived_zero", "explicit_zero", "tensor_zero"])
+def test_fused_head_zero_denominator_keeps_nan_loss_and_zero_ignored_dx(denominator):
+    pytest.importorskip("soup_cli.utils.stream_loss_chunk")
+    from solution.autograd import fused_head
+
+    x, w, targets = _inputs(6, 32, 1000, torch.float32, "all", hidden_dtype=torch.float32)
+    hidden = x.detach().reshape(2, 3, 32).requires_grad_()
+    reference = hidden.detach().clone().requires_grad_()
+    labels = targets.reshape(2, 3)
+    divisor = {"derived_zero": None, "explicit_zero": 0,
+               "tensor_zero": torch.zeros((), device="cuda", dtype=torch.int64)}[denominator]
+    loss, step = fused_head(hidden, w, labels, num_items_in_batch=divisor)
+    baseline_logits = F.linear(reference.half(), w.half()).float().reshape(6, -1)
+    baseline_loss = F.cross_entropy(baseline_logits, targets, reduction="mean")
+    assert torch.isnan(loss) and torch.isnan(baseline_loss)
+    loss.backward()
+    baseline_loss.backward()
+    assert torch.isfinite(hidden.grad).all() and torch.isfinite(reference.grad).all()
+    assert torch.count_nonzero(hidden.grad).item() == 0
+    assert torch.count_nonzero(reference.grad).item() == 0
+    assert step.labelled.item() == 0
+    assert torch.count_nonzero(step.token_loss).item() == 0
+
+
 def test_separate_pure_fp32_reference():
     x, w, y = _inputs(77, 64, 1000, torch.float32, hidden_dtype=torch.float32)
     _compare(x, w, y, torch.randn(77, device="cuda"), pure_fp32=True)

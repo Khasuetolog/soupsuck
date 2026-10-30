@@ -1,24 +1,37 @@
 """Frozen linear head, cross entropy and metrics without full vocabulary logits.
 
-Logits follow baseline AMP: z=float32(round_fp16(fp16(X)@fp16(W).T)).
+Logits follow baseline AMP's actual operation: F.linear(fp16(X),fp16(W)).
+We call torch.mm with fp16 inputs AND fp16 output, respecting the caller's
+allow_fp16_reduced_precision_reduction flag, exactly as a bias-free F.linear.
+We do not assume equivalence to round_fp16(a GEMM with fp32 output): cuBLAS
+may choose a different reduction algorithm under the same backend flags.
+PyTorch 2.11 Context.h defaults to AllowReducedPrecisionWithSplitK while
+allow_fp16_accumulation is false; neither flag is changed by this function.
 For each row we maintain m=max(z), s=sum(exp(z-m)), t=sum(exp(z-m)*z).
 When a vocabulary chunk raises m, both s and t are rescaled by exp(m_old-m).
 Then lse=m+log(s), loss=lse-z_target, entropy=lse-t/s. Ignored targets
 have zero loss and gradient, but still get entropy, argmax and lse.
 
-On sm_75 we choose cuBLAS tensor-core GEMMs with fp16 operands and fp32
-accumulation/output (torch 2.11 CUDA out_dtype), rather than a hand-tuned
+On sm_75 we choose cuBLAS tensor-core GEMMs with fp16 operands/output for
+logits and fp32 output for the dX GEMM, rather than a hand-tuned
 tl.dot implementation: cuBLAS handles the 1536-wide reduction and row tails,
 while our Triton kernels fuse the vocabulary statistics and softmax derivative.
 This is an engineering choice, not a measured T4 speed claim. No bf16 or TF32
 path is used. V chunks default to 4096, with 4-warps row reductions; limits
-also cap each fp32 logit buffer at 64 MiB and each weight cast at 32 MiB.
-At N=2048,H=1536: logits 32 MiB, cast weight 12 MiB; backward adds fp16 dZ
-16 MiB, fp32 dX accumulator 12 MiB and GEMM result 12 MiB (about 84 MiB
-of live temporary tensors, plus 6 MiB if hidden needs an fp32-to-fp16 cast;
-excluding inputs, outputs and cuBLAS workspace).
+also cap each fp16 logit buffer at 64 MiB and each weight cast at 32 MiB.
+At N=2048,H=1536: logits 16 MiB (previously 32 MiB), cast weight 12 MiB;
+backward dZ is 16 MiB, with 12 MiB fp32 dX and a 12 MiB GEMM result.
+Logits are freed before the dX GEMM; excluding inputs/outputs/workspace the
+largest full-row overlap is about 56 MiB, plus any hidden cast (6 MiB).
+Compaction additionally copies only [valid_rows,H] fp16 hidden and small
+row vectors; the full zero-filled gradient is allocated after GEMM temporaries.
 Only hidden, frozen weight (a reference, not a copy), targets and lse survive
-forward. Backward recomputes chunks and computes dZ=g*(p-onehot) in fp32.
+forward. Backward compacts hidden/targets/lse/upstream to the valid-target
+rows only, recomputes chunks and computes dZ=g*(p-onehot) in fp32. It skips
+all GEMMs when no targets are valid, avoids gathers when all are valid, and
+scatters partial-row dX into a zero-filled output. Compaction needs one
+nonzero synchronization, outside the vocabulary loop. Forward still computes
+entropy/argmax/lse for EVERY row, including ignored rows.
 Before casting dZ to fp16 we divide each row by max(abs(g),1e-30)/1024;
 the cast operands are bounded by about 1024 even with GradScaler. After
 fp32 accumulation we undo this scaling, protecting tiny probabilities and
@@ -42,7 +55,7 @@ def vocabulary_statistics_kernel(Z, Targets, State, Best, Width, Start,
     row = tl.program_id(0)
     col = tl.arange(0, BLOCK)
     z = tl.load(Z + row * Width + col, col < Width, other=-float("inf"))
-    z = z.to(tl.float16).to(tl.float32)
+    z = z.to(tl.float32)
     tile_max = tl.max(z, axis=0)
     tile_arg = tl.min(tl.where((col < Width) & (z == tile_max),
                                col + Start, 2147483647), axis=0)
@@ -100,7 +113,7 @@ def vocabulary_derivative_kernel(Z, Targets, Lse, Grad, Gain, Dz, Width, Start,
     target = tl.load(Targets + row)
     lse = tl.load(Lse + row)
     z = tl.load(Z + row * Width + cols, cols < Width, other=-float("inf"))
-    z = z.to(tl.float16).to(tl.float32)
+    z = z.to(tl.float32)
     g = tl.load(Grad + row)
     gain = tl.load(Gain + row)
     dz = (tl.exp(z - lse) - (cols + Start == target).to(tl.float32)) * g
@@ -110,7 +123,7 @@ def vocabulary_derivative_kernel(Z, Targets, Lse, Grad, Gain, Dz, Width, Start,
 
 
 def _chunk_size(n, h):
-    limit = min(4096, (64 * 1024**2) // (4 * max(n, 1)),
+    limit = min(4096, (64 * 1024**2) // (2 * max(n, 1)),
                 (32 * 1024**2) // (2 * h))
     if limit < 1:
         raise ValueError("A single vocabulary column exceeds the temporary memory budget")
@@ -133,7 +146,7 @@ class _FrozenLinearCrossEntropy(torch.autograd.Function):
             with torch.autocast(device_type="cuda", enabled=False):
                 for start in range(0, v, chunk):
                     w = weight[start:start + chunk].to(torch.float16).contiguous()
-                    z = torch.mm(hidden, w.t(), out_dtype=torch.float32)
+                    z = torch.mm(hidden, w.t())
                     width = w.shape[0]
                     vocabulary_statistics_kernel[(n,)](
                         z, targets, state, best, width, start, IGNORE=ignore_index,
@@ -155,25 +168,47 @@ class _FrozenLinearCrossEntropy(torch.autograd.Function):
             return None, None, None, None
         hidden, weight, targets, lse = ctx.saved_tensors
         n, _ = hidden.shape
-        dx = torch.zeros_like(hidden, dtype=torch.float32)
-        if n:
-            with torch.autocast(device_type="cuda", enabled=False):
-                grad = grad_loss.float().contiguous()
-                gain = grad.abs().clamp_min_(1e-30).div_(1024.0)
-                for start in range(0, weight.shape[0], ctx.chunk):
-                    w = weight[start:start + ctx.chunk].to(torch.float16).contiguous()
-                    z = torch.mm(hidden, w.t(), out_dtype=torch.float32)
-                    width = w.shape[0]
-                    dz = torch.empty_like(z, dtype=torch.float16)
-                    vocabulary_derivative_kernel[(n, triton.cdiv(width, 256))](
-                        z, targets, lse, grad, gain, dz, width, start,
-                        IGNORE=ctx.ignore_index, BLOCK=256)
-                    del z
-                    contribution = torch.mm(dz, w, out_dtype=torch.float32)
-                    dx.add_(contribution)
-                    del dz, w, contribution
-                dx.mul_(gain.reshape(n, 1))
-        return dx.to(ctx.hidden_dtype), None, None, None
+        if not n:
+            return torch.zeros_like(hidden, dtype=ctx.hidden_dtype), None, None, None
+        valid_indices = torch.nonzero(targets != ctx.ignore_index, as_tuple=False).flatten()
+        valid_n = valid_indices.numel()
+        if not valid_n:
+            # A zero-denominator mean loss can send inf/NaN upstream. Ignored
+            # CE gradients are zero regardless: never form 0 * nonfinite gain.
+            return torch.zeros_like(hidden, dtype=ctx.hidden_dtype), None, None, None
+        compact = valid_n < n
+        if compact:
+            # Gather BEFORE computing gains, excluding any nonfinite upstream
+            # on ignored rows from both GEMMs and the final rescaling.
+            work_hidden = hidden.index_select(0, valid_indices)
+            work_targets = targets.index_select(0, valid_indices)
+            work_lse = lse.index_select(0, valid_indices)
+            work_grad = grad_loss.index_select(0, valid_indices)
+        else:
+            work_hidden, work_targets, work_lse, work_grad = hidden, targets, lse, grad_loss
+        dx = torch.zeros_like(work_hidden, dtype=torch.float32)
+        with torch.autocast(device_type="cuda", enabled=False):
+            grad = work_grad.float().contiguous()
+            gain = grad.abs().clamp_min_(1e-30).div_(1024.0)
+            for start in range(0, weight.shape[0], ctx.chunk):
+                w = weight[start:start + ctx.chunk].to(torch.float16).contiguous()
+                z = torch.mm(work_hidden, w.t())
+                width = w.shape[0]
+                dz = torch.empty_like(z, dtype=torch.float16)
+                vocabulary_derivative_kernel[(valid_n, triton.cdiv(width, 256))](
+                    z, work_targets, work_lse, grad, gain, dz, width, start,
+                    IGNORE=ctx.ignore_index, BLOCK=256)
+                del z
+                contribution = torch.mm(dz, w, out_dtype=torch.float32)
+                dx.add_(contribution)
+                del dz, w, contribution
+            dx.mul_(gain.reshape(valid_n, 1))
+        dx = dx.to(ctx.hidden_dtype)
+        if compact:
+            full_dx = torch.zeros_like(hidden, dtype=ctx.hidden_dtype)
+            full_dx.index_copy_(0, valid_indices, dx)
+            dx = full_dx
+        return dx, None, None, None
 
 
 def fused_linear_cross_entropy(hidden, weight, targets, ignore_index=-100):
