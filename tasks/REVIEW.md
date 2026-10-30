@@ -738,3 +738,230 @@ RNG, значения после dropout перед A, gradients перед RMSN
 updates при nonzero B/нескольких seed. Проверить NF4 functional/backend markers
 после cold import и already-loaded apply. Значения скорости/памяти/quality
 коммита de836e0 не переносятся на этот новый default автоматически.
+
+## S-028 — unpad S-024 и взаимодействие с fused RoPE S-022
+
+Дата: 2026-10-30. Проверен **неизменный снимок `2004b33`**:
+`solution/unpad.py`, конец Qwen callback в `solution/patch.py`,
+`solution/tests/test_unpad.py`; RoPE — реализация из `585de28`, присутствующая
+в этом снимке. Текущие параллельные изменения S-027 не ревьюились.
+Изменён только этот раздел отчёта; коммитов и Kaggle-запусков нет.
+
+**Итог:** нового доказанного P0/P1 для штатного Qwen2/NF4/LoRA training-пути
+не найдено. Множество допустимых attention-ключей и позиции real tokens
+сохранены; dropout восстанавливает padded геометрию до native вызова.
+Это статический вывод, **не GPU-сертификация**: изменяются формы GEMM/SDPA,
+их округления и потенциально выбранные реализации. Численный риск раннего
+fp16 input norm из P1-023-1 остаётся. Найдены P2 по стоимости синхронизаций
+и полноте независимого integration acceptance.
+
+### Источники и воспроизводимость
+
+Здесь `SITE` означает локальный pinned source root:
+`/private/tmp/claude-501/-Users-arystan-orca-workspaces-decentrathon-6-0-featherduster/c29b337b-6a21-4aad-b075-87130cee4abf/scratchpad/src/site`.
+Ссылки на строки `solution/*` ниже относятся **к `git show 2004b33:<path>`**,
+а не к меняющемуся checkout; ссылки RoPE также совпадают с `585de28`.
+
+- Transformers 5.16.1: `SITE/transformers/models/qwen2/modeling_qwen2.py:87-102`
+  (cos/sin), `:105-138` (RoPE), `:195-234` (attention), `:341-407` (model loop).
+- `SITE/transformers/masking_utils.py:235-285`, `:487-519`, `:851-859`,
+  `:935-995`: SDPA causal/padding mask, skip и packed-position detection.
+- `SITE/transformers/integrations/sdpa_attention.py:15-37`, `:94-107`,
+  `:124`, `:158-170`: repeat KV, masked GQA policy, SDPA и contiguous output.
+- PEFT 0.20.0: `SITE/peft/tuners/lora/bnb.py:513-552`,
+  `SITE/peft/tuners/lora/layer.py:1033-1071`: base→dropout→A→B порядок.
+- PyTorch 2.11.0: [native CUDA dropout](https://github.com/pytorch/pytorch/blob/v2.11.0/aten/src/ATen/native/cuda/Dropout.cu#L188-L243),
+  `:360-388` (launch/Philox). Прочитан upstream source, не выполнялся GPU-код.
+
+Локально распакован `git archive 2004b33 solution` во временный каталог,
+в нём выполнено:
+
+```text
+/private/tmp/s004-integration-venv/bin/python -m pytest solution/tests/test_unpad.py -q -rs
+16 passed, 15 skipped in 0.17s
+```
+
+Причина всех 15 skips: отсутствует torch. Это проверяет layout/scope/fake
+control flow, но **не** CPU numerical equivalence и **не** CUDA/bnb.
+Независимая stdlib-проверка causal key sets перебрала 5628 layouts
+(B=1..4, S=1..7, все непустые right-padded lengths): расхождений нет.
+Это математическая проверка масок, а не запуск настоящего SDPA.
+
+### P2-028-1 — заявленная одна синхронизация на batch не описывает весь preflight
+
+- **Файл:строка:** `solution/unpad.py:220-226`; `_scatter:96-103`,
+  `_bind_dropout:254-259`, attention `:285-299`.
+- `attention_mask.detach().tolist()` переносит mask на host. Затем CUDA
+  boolean indexing `labels[attention_mask == 0]` имеет динамический размер
+  (обычно nonzero/index path с определением размера на host), а `bool(...all())`
+  отдельно требует scalar device→host. Поэтому обещать только один sync
+  для всего batch нельзя. Внутри layer loop повторных `.item()` не найдено.
+- На каждой из q/v dropout ветвей каждого слоя `_scatter` создаёт padded
+  zeros, затем **out-of-place** `index_copy` выделяет ещё один padded результат;
+  native dropout создаёт output/mask, после чего `_pack` делает gather.
+  Два padded fp32 буфера и полная dropout-mask остаются ценой RNG-equivalence.
+- Attention делает до B SDPA вызовов на слой, затем `cat`; для B=4 и 28 слоёв
+  это до 112 SDPA вызовов в forward вместо 28. Helper дополнительно делает
+  transpose/contiguous для каждой строки. Маски кэшируются по length только
+  внутри одного PackedBatch и переиспользуются между слоями, не между шагами.
+- **Минимальное улучшение:** проверять padding labels одним scalar reduction
+  без динамического boolean selection; проверить безопасное заполнение
+  destination без второго полного padded allocation. При любом изменении
+  оставить padded native dropout и autograd-контракт. Отдельно измерить
+  preflight, gather/scatter/cat и реальный SDPA backend на T4; знак выигрыша
+  нельзя вывести из числа убранных pad tokens.
+
+### P2-028-2 — standalone unpad tests не гарантируют совместный путь всех патчей
+
+- **Файл:строка:** `solution/tests/test_unpad.py:129-146`, `:236-313`.
+- Fixture устанавливает только `patch_qwen2_unpad(module)`. Она не вызывает
+  `solution.apply()`, не проверяет RoPE marker и не требует `outputs.logits
+  is None`. bnb fixture отдельно включает lora.py, но не norm/decoder/head.
+  `_statistics:219-233` принимает и dense logits, и fused step, поэтому
+  standalone зелёный тест может не упражнять fused CE/bridge вообще.
+- При запуске всей suite предыдущие integration tests могут уже вызвать
+  apply; тогда тот же тест попадает в совместный путь из-за глобального
+  состояния. Это полезный дополнительный охват, но не независимый acceptance.
+- **Минимальный тест:** в отдельном процессе вызвать apply дважды, создать
+  реальную Qwen2+PEFT bnb q/v LoRA с nonzero B, включить fp16 AMP, убедиться
+  в non-None plan, активном RoPE marker и `outputs.logits is None`, сравнить
+  masks/RNG/loss/A,B gradients и ChunkedStep с SOUP_UNPAD=0. Отдельно прогнать
+  trainer bridge/Rewind, чтобы проверялись gather/token counts и row outputs.
+- Fallback parametrization `:316-344` покрывает eval/cache/left/no-mask/hidden/
+  supervised padding. Нет отдельных численных тестов inputs_embeds,
+  gradient checkpointing, explicit position_ids и exception после входа
+  в label scope. Static guards ниже проверены; это пробел тестов, не доказанный
+  дефект реализации. Полные 79 Soup tests на этом снимке здесь не запускались.
+
+### 1. Attention: допустимые ключи совпадают, dispatch не обещает bitwise equality
+
+Baseline SDPA создаёт bool mask `causal AND key_padding`. Для real query
+позиции i строки b с длиной L_b её true keys равны `0..i`, i<L_b; правые
+pad keys не входят. Unpad `:286-296` вызывает SDPA отдельно на `[0,L_b)` с
+bool tril и `is_causal=False`: множество ключей то же, других строк нет.
+Пустые/left/interior-padded строки отклоняет `right_padding_lengths:43-66`.
+Полностью непаддированный batch остаётся original (`:224`).
+
+`self.scaling` передаётся без изменения, attention dropout допускается
+только 0 (`:124`), поэтому сегментация не потребляет attention RNG.
+Оба masked helper-вызова получают non-None bool mask: SDPA helper повторяет
+KV по `num_key_value_groups`, не включает GQA fast path. Autocast и tensor
+dtypes не переопределяются; q/k RoPE promotion и v следуют тем же правилам.
+Backend enable/disable settings не изменяются. Однако форма batch/sequence
+и strides меняются: **mem-efficient backend не зафиксирован этим кодом**,
+его выбор и численное совпадение надо проверить в профиле T4. Отсутствие
+pad keys математически не меняет real softmax, но иной reduction/GEMM shape
+не доказывает равенство floating-point выходов или gradients побитно.
+
+### 2. Position ids, cache и RoPE в packed форме
+
+При position_ids=None baseline Qwen2 строит `[0..S-1]` из sequence length.
+Unpad `:324-328` строит те же позиции **до** packing и выбирает real индексы:
+получаются `[0..L_0-1, 0..L_1-1, ...]`, а не единый arange(T).
+Явные position_ids допустимой формы также выбираются, не перенумеровываются.
+Baseline при non-None 2D attention_mask не включает отдельное обнаружение
+packed sequences по resets (`masking_utils.py:851-859`), поэтому отсутствие
+этого распознавания в unpad само по себе не меняет контракт.
+
+`attention_mask={"full_attention": None}` в `unpad.py:335` соответствует
+Qwen2Model's prepared-mask contract и исключает глобальную causal mask
+между packed строками. Настоящую mask применяет наш segmented attention.
+Sliding layers и non-default/dynamic RoPE отвергаются preflight. Cache
+обязательно отсутствует/выключен. Отдельный `cache_position` попадает в
+неизвестные kwargs и вызывает original, поэтому с cache-offset он не теряется.
+
+Qwen2RotaryEmbedding вычисляет cos/sin из переданных позиций, с shape
+`[1,T,D]`. q/k после projection имеют `[1,Hq|Hk,T,D]`; BHSD strides и even D
+удовлетворяют `solution/rope.py:25-45`. Kernel адресует token как `row % Tokens`,
+cos batch через CBatches и не предполагает, что позиции монотонны глобально.
+RoPE — независимая операция по token, reset между строками ей не мешает.
+`unpad.py:284` вызывает модульный атрибут, действительно перехватывая патч.
+
+`rope_pair_forward_kernel` (`kernels/rope.py:25-61`) отдельно округляет оба
+произведения в promoted dtype перед суммой, FMA выключен при launch `:109-113`.
+Backward `:65-98` использует adjoint: dx1=g1*c1+g2*s2,
+dx2=g2*c2−g1*s1, с cast каждой ветви к input dtype до accumulation.
+Для двух половинок вращения это правильные знаки; unpad не меняет формулу.
+Сохраняются cos/sin и metadata, не q/k; masked loads/stores разделяют q/k
+и хвосты. S/T — runtime argument; recompilation tests существуют, но packed
+B=1/T sweep здесь не запускался. Unsupported layouts/cos gradients идут в
+собственный eager fallback, не в optional hub wrapper (`rope.py:70-76`).
+Ни один из этих патчей не запрашивает готовый hub kernel.
+
+### 3. LoRA dropout: instance ownership и fp16 ingress
+
+`_dropouts:127-176` разрешает vanilla одиночный q/v адаптер, прямые A/B fp32,
+точный Dropout/Identity, без variants/DoRA/merged/disabled/mixed hooks.
+Другие обучающие stochastic Dropout в дереве приводят к original до RNG.
+Native Dropout class не меняется: только выбранные объекты получают MethodType
+с marker (`:241-262`); повторный bind не оборачивает второй раз.
+Вне `_ACTIVE` bind вызывает сохранённый original. `_packing_scope:82-88`
+и causal label scope `:353-360` восстанавливаются через finally, включая
+исключения; backward native dropout не требует этих scope (checkpointing
+отвергнут). Привязка остаётся на instance и безопасно обслуживает eval/fallback.
+
+На fp16 входе зарегистрированный bnb wrapper сначала выполняет base_layer,
+затем `x.float()`, затем тот же Dropout (`lora.py:116-123`). Bind видит
+`[1,T,H] fp32`, scatter даёт `[B,S,H] fp32 contiguous` с allocator alignment;
+после original dropout real rows собираются обратно. Тип/форма guard `:254`
+для этого пути не падает. `_eligible` не запрещает certified dropout bind,
+а `fp16_ingress_ready` не принимает instance override самого projection.
+Dense PEFT LoRA кастует input к fp32 A перед dropout, что также подходит.
+
+По CUDA Dropout.cu геометрия/Philox increment зависят от numel/device,
+vectorization — от dtype/layout/alignment. Маска берётся из seed/offset/thread,
+не из значений. При одинаковом исходном RNG, p и порядке q/v восстановленный
+fp32 padded вызов сохраняет mask и расход RNG. Это условно на обычный aligned
+baseline norm output; произвольный невыравненный custom forward не сертифицирован.
+Паддинговые нули не влияют на RNG, но не позволяют считать `output != 0`
+доказательством равенства маски на самих pad позициях. Тест корректно сравнивает
+real позиции и конечное generator state.
+
+Уже существующее раннее half-округление из P1-023-1 не становится точным:
+`dropout(float(half(x)))` не равно `dropout(x)`, и общие half gradients имеют
+иные accumulation boundaries. Packing дополнительно меняет GEMM shapes;
+одинаковая маска не доказывает численную эквивалентность A/B updates.
+
+### 4. Fallbacks и наблюдаемые выходы
+
+`_plan:178-238` требует training, labels текущего causal call и тот же объект
+attention_mask, SDPA, use_cache=False, без past/checkpoint/sliding/dynamic RoPE.
+Eval/generation без labels, cache, left padding, missing mask, requested
+hidden_states/attentions, unknown kwargs и nonignored pad labels вызывают
+original до stochastic work. `_ACTIVE` предотвращает повторную упаковку.
+**inputs_embeds не является fallback**: при согласованных B,S/device оно
+поддержано и pack выполнен в `:332`; numerical test этого варианта отсутствует.
+Fake-модули отсекаются точными module/class checks `:375-380` и guard callback;
+однако статическая проверка фейков не заменяет запуск всех 79 Soup tests.
+
+После model norm real hidden states scatter возвращает в исходные row-major
+позиции, padded hidden states становятся нулём (`:337`). Поэтому **полный
+last_hidden_state и padded logits не равны baseline**, если наблюдать их
+непосредственно. Запрос hidden_states приводит к fallback; контракт обычного
+training loss/метрик сравнивает допустимые позиции, не pad logits.
+Shift остаётся отдельно внутри каждой исходной строки (`autograd.py:10`):
+последний real token перед padding предсказывает ignored pad target, между
+строками target не переезжает. Последняя позиция всей строки также ignored.
+Loss sum/denominator не меняются, ignored token_loss равен нулю.
+
+Entropy на padded logits меняется, но `_log_metrics` умножает её на исходную
+attention_mask; accuracy учитывает только labels[:,1:] != -100. Поэтому
+паддинговые предсказания не входят ни в один из этих агрегатов. num_tokens
+использует прежнюю mask. ChunkedStep остаётся `[B,S]`, с прежними ignored
+losses и valid counts, пригодными для Rewind per-row means. Это формулы и
+static graph proof, не выполненный trainer/Rewind integration test.
+В `2004b33` head всё ещё обрабатывает полный scattered `[B,S,H]`, поэтому
+CE forward/entropy вычисляются и для padding. Packed head — отдельное S-027,
+его корректность и экономия этому ревью не приписываются.
+
+### Следующие проверки T4 (здесь UNVERIFIED)
+
+1. Standalone совместный integration test из P2-028-2; несколько seed,
+   nonzero LoRA B, обычный r=16/p=0.05, mixed/length-one/equal-short rows.
+2. Explicit position_ids и inputs_embeds; disabled scopes после исключения,
+   checkpoint/use_cache/generation fallbacks. RoPE B=1/T sweep с backward.
+3. `pytest solution -q -rs` и `SOUP_APPLY_SOLUTION=1 pytest tests -q` в новых
+   процессах; затем неизменный paired harness/checks, с финальным snapshot.
+4. Профиль реального SDPA backend, числа SDPA вызовов, host sync, dropout
+   scatter/gather, cat и остаточной padded CE. Не фиксировать backend ради
+   хорошего профиля и не переносить сюда результаты ce1ff09 автоматически.
