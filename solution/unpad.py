@@ -151,8 +151,48 @@ def _scatter(x, batch):
 
     tail = x.shape[2:]
     flat = torch.zeros((batch.batch * batch.sequence, *tail), device=x.device, dtype=x.dtype)
-    return flat.index_copy(0, batch.indices, x.reshape(batch.tokens, *tail)).reshape(
+    # Fresh, unaliased destination: in-place index_copy keeps its autograd
+    # edge to x without a second padded allocation/copy of the zero buffer.
+    return flat.index_copy_(0, batch.indices, x.reshape(batch.tokens, *tail)).reshape(
         batch.batch, batch.sequence, *tail)
+
+
+def _batch_metadata(mask, labels):
+    """One fixed-size D2H transfer for mask geometry AND padding-label safety.
+
+    No CUDA boolean selection/nonzero and no separate bool(tensor)/item sync.
+    Binary validity is checked before encoding to uint8, including float masks.
+    """
+    import torch
+
+    if not mask.shape[0] or not mask.shape[1]:
+        return None
+    real = mask != 0
+    valid = (((mask == 0) | (mask == 1)) & (real | (labels == -100))).all()
+    metadata = torch.cat((real.reshape(-1).to(torch.uint8), valid.reshape(1).to(torch.uint8)))
+    values = metadata.tolist()  # the only device-to-host synchronization
+    if not values[-1]:
+        return None
+    sequence = mask.shape[1]
+    return [values[start:start + sequence] for start in range(0, len(values) - 1, sequence)]
+
+
+def _indices_from_lengths(lengths, sequence, device):
+    """Build known-size row-major indices on-device, without a blocking H2D.
+
+    torch.tensor(python_list, device='cuda') adds a synchronous host-to-device
+    copy. arange and fixed-size slice updates enqueue kernels using CPU lengths.
+    """
+    import torch
+
+    indices = torch.arange(sum(lengths), device=device, dtype=torch.long)
+    start = 0
+    for row, length in enumerate(lengths):
+        offset = row * sequence - start
+        if offset:
+            indices.narrow(0, start, length).add_(offset)
+        start += length
+    return indices
 
 
 def _no_hooks(module):
@@ -270,12 +310,11 @@ def _plan(model, module, input_ids, attention_mask, position_ids, past_key_value
     elif source.device.type != "cpu":
         return None
     batch, sequence = attention_mask.shape
-    # One mask-to-host sync per batch, never per layer. Python validates left/
-    # interior padding and obtains row boundaries without repeated GPU item().
-    lengths = right_padding_lengths(attention_mask.detach().tolist())
+    # Validate the mask and ignored padding in one host transfer, once per
+    # batch. All decoder layers share the CPU lengths and per-length masks.
+    rows = _batch_metadata(attention_mask, labels)
+    lengths = right_padding_lengths(rows) if rows is not None else None
     if lengths is None or sum(lengths) == batch * sequence:
-        return None
-    if not bool((labels[attention_mask == 0] == -100).all()):
         return None
     if position_ids is not None and (not isinstance(position_ids, torch.Tensor)
             or position_ids.device != source.device or position_ids.ndim != 2
@@ -284,8 +323,7 @@ def _plan(model, module, input_ids, attention_mask, position_ids, past_key_value
     dropouts = _dropouts(model, module)
     if dropouts is None:
         return None
-    flat_indices = [row * sequence + col for row, length in enumerate(lengths) for col in range(length)]
-    indices = torch.tensor(flat_indices, device=source.device, dtype=torch.long)
+    indices = _indices_from_lengths(lengths, sequence, source.device)
     return PackedBatch(batch, sequence, model.config.hidden_size, lengths, indices, dropouts,
                        frozenset(id(layer.self_attn) for layer in model.layers))
 

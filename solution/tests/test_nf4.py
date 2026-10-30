@@ -23,10 +23,11 @@ def native_bnb(monkeypatch):
     if bnb.__version__ != "0.50.2":
         pytest.skip("NF4 format/backend acceptance is pinned to bitsandbytes 0.50.2")
     backend = importlib.import_module("bitsandbytes.backends.cuda.ops")
-    # Integration tests may already have installed the solution. Restore BOTH
+    # Integration tests may already have installed the solution. Restore all
     # entries while computing oracles so a wrapper cannot compare against itself.
     monkeypatch.setattr(bnb.functional, "dequantize_4bit", _original(bnb.functional.dequantize_4bit))
     monkeypatch.setattr(backend, "_dequantize_4bit_impl", _original(backend._dequantize_4bit_impl))
+    monkeypatch.setattr(backend, "_dequant_linear_fallback", _original(backend._dequant_linear_fallback))
     return bnb, backend
 
 
@@ -113,9 +114,11 @@ def test_patch_covers_functional_dispatcher_forward_and_backward(native_bnb, mon
 
     monkeypatch.setattr(nf4, "nf4_decode_kernel", LaunchSpy())
     assert patch_bnb_dequant()
-    f, raw = bnb.functional.dequantize_4bit, backend._dequantize_4bit_impl
+    f, raw, linear = (bnb.functional.dequantize_4bit, backend._dequantize_4bit_impl,
+                      backend._dequant_linear_fallback)
     assert patch_bnb_dequant()
-    assert bnb.functional.dequantize_4bit is f and backend._dequantize_4bit_impl is raw
+    assert (bnb.functional.dequantize_4bit is f and backend._dequantize_4bit_impl is raw
+            and backend._dequant_linear_fallback is linear)
     _assert_bits(f(packed, state), expected_weight)
     assert calls == [True]
     out = torch.empty_like(expected_weight)
@@ -126,7 +129,7 @@ def test_patch_covers_functional_dispatcher_forward_and_backward(native_bnb, mon
     dispatched = torch.ops.bitsandbytes.dequantize_4bit.default(
         packed, scales, 64, "nf4", state.shape, torch.float16)
     _assert_bits(dispatched, expected_weight)
-    assert calls == [False]
+    assert calls == []  # flat dispatcher has no nested provenance: native
     calls.clear()
     x = torch.randn((1537, 64), device="cuda", dtype=torch.float16, requires_grad=True)
     reference_x = x.detach().clone().requires_grad_()
@@ -143,6 +146,59 @@ def test_patch_covers_functional_dispatcher_forward_and_backward(native_bnb, mon
     calls.clear()
     _assert_bits(f(packed_fp4, fp4_state), expected_fp4)
     assert calls == []  # unsupported format stays on the saved originals
+
+
+@pytest.mark.parametrize("transpose", [False, True])
+def test_nested_out_writes_destination_without_full_temporary(native_bnb, monkeypatch, transpose):
+    from solution.nf4_patch import patch_bnb_dequant
+    from solution.kernels import nf4
+
+    bnb, _ = native_bnb
+    packed, state = _quantized(bnb, (256, 64))
+    expected = bnb.functional.dequantize_4bit(packed, state)
+    # Warm table and compiled variants before checking allocation behavior.
+    nf4.dequantize_nf4(packed, state)
+    out = torch.empty_like(expected)
+    assert patch_bnb_dequant()
+    native_empty = torch.empty
+    def no_output_allocation(*args, **kwargs):
+        raise AssertionError("nested out= allocated an extra output")
+    monkeypatch.setattr(torch, "empty", no_output_allocation)
+    source = packed.t() if transpose else packed
+    actual = bnb.functional.dequantize_4bit(source, state, out=out)
+    assert actual.data_ptr() == out.data_ptr()
+    _assert_bits(actual, expected.t() if transpose else expected)
+    monkeypatch.setattr(torch, "empty", native_empty)
+
+
+def test_non_nested_functional_forward_and_backward_stay_native(native_bnb, monkeypatch):
+    from solution.nf4_patch import patch_bnb_dequant, _NESTED_BACKEND
+    from solution.kernels import nf4
+
+    bnb, _ = native_bnb
+    torch.manual_seed(32032)
+    values = torch.randn((128, 64), device="cuda", dtype=torch.float16)
+    packed, state = bnb.functional.quantize_4bit(
+        values, quant_type="nf4", compress_statistics=False, blocksize=64)
+    expected = bnb.functional.dequantize_4bit(packed, state)
+    assert patch_bnb_dequant()
+    class NoLaunch:
+        def __getitem__(self, grid):
+            raise AssertionError("non-nested state must never use our NF4 decoder")
+    monkeypatch.setattr(nf4, "nf4_decode_kernel", NoLaunch())
+    _assert_bits(bnb.functional.dequantize_4bit(packed, state), expected)
+    out = torch.empty_like(expected)
+    _assert_bits(bnb.functional.dequantize_4bit(packed, state, out=out), expected)
+    x = torch.randn((1537, 64), device="cuda", dtype=torch.float16, requires_grad=True)
+    xr = x.detach().clone().requires_grad_()
+    actual = bnb.matmul_4bit(x, packed.t(), quant_state=state)
+    reference = F.linear(xr, expected)
+    _assert_bits(actual, reference)
+    upstream = torch.randn_like(actual)
+    actual.backward(upstream)
+    reference.backward(upstream)
+    _assert_bits(x.grad, xr.grad)
+    assert _NESTED_BACKEND.get() is False
 
 
 def test_unsupported_states_raise_before_launch(native_bnb):

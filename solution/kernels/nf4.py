@@ -117,11 +117,16 @@ def _dequantize_flat_into(packed, absmax, out):
     return out
 
 
-def dequantize_nf4(packed, quant_state, out_dtype=torch.float16):
-    """Decode the supported bnb state, including its packed-input transpose shim."""
+def dequantize_nf4(packed, quant_state, out_dtype=torch.float16, *, out=None):
+    """Decode directly into out (canonical state.shape), then apply the BC view."""
     shape = _validate_state(packed, quant_state, out_dtype)
+    if out is not None and (not isinstance(out, torch.Tensor) or tuple(out.shape) != shape
+                            or out.device != packed.device or out.dtype != out_dtype
+                            or not out.is_contiguous() or out.requires_grad):
+        raise ValueError("Expected a contiguous non-grad out buffer matching quant_state")
     with torch.cuda.device(packed.device):
-        out = torch.empty(shape, device=packed.device, dtype=out_dtype)
+        if out is None:
+            out = torch.empty(shape, device=packed.device, dtype=out_dtype)
         nf4_decode_kernel[(triton.cdiv(out.numel(), 2048),)](
             packed, quant_state.absmax, quant_state.state2.absmax, quant_state.state2.code,
             quant_state.offset, _table(packed.device), out, out.numel(),

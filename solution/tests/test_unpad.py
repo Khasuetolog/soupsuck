@@ -106,6 +106,7 @@ def test_instance_binding_does_not_modify_dropout_class(monkeypatch):
 def test_plan_preserves_row_order_and_rejects_supervised_padding(monkeypatch):
     """Control-flow check on metadata; no pretend tensor/numerical acceptance."""
     device = SimpleNamespace(type="cpu")
+    transfers = []
     class Tensor:
         requires_grad = False
         def __init__(self, data, **kwargs):
@@ -116,17 +117,44 @@ def test_plan_preserves_row_order_and_rejects_supervised_padding(monkeypatch):
         def detach(self):
             return self
         def tolist(self):
+            transfers.append(self)
             return self.data
+        def flat(self):
+            return [x for row in self.data for x in row] if self.ndim == 2 else self.data
+        def reshape(self, *shape):
+            return Tensor(self.flat())
+        def to(self, dtype):
+            return self
         def __eq__(self, value):
             if self.ndim == 2:
                 return Tensor([[x == value for x in row] for row in self.data])
             return Tensor([x == value for x in self.data])
+        def __ne__(self, value):
+            return self == (1 if value == 0 else 0)
+        def combine(self, other, op):
+            if self.ndim == 2:
+                return Tensor([[op(x, y) for x, y in zip(a, b)] for a, b in zip(self.data, other.data)])
+            return Tensor([op(x, y) for x, y in zip(self.data, other.data)])
+        def __or__(self, other):
+            return self.combine(other, lambda x, y: x or y)
+        def __and__(self, other):
+            return self.combine(other, lambda x, y: x and y)
         def __getitem__(self, selector):
-            return Tensor([x for row, flags in zip(self.data, selector.data)
-                           for x, flag in zip(row, flags) if flag])
+            raise AssertionError("dynamic boolean selection is forbidden in preflight")
+        def __bool__(self):
+            raise AssertionError("separate scalar D2H is forbidden in preflight")
         def all(self):
-            return all(self.data)
-    fake = SimpleNamespace(Tensor=Tensor, tensor=Tensor, long="int64")
+            return Tensor([all(self.flat())])
+        def narrow(self, axis, start, length):
+            parent = self
+            class Slice:
+                def add_(self, value):
+                    for index in range(start, start + length):
+                        parent.data[index] += value
+            return Slice()
+    fake = SimpleNamespace(Tensor=Tensor, long="int64", uint8="uint8",
+                           arange=lambda n, **kw: Tensor(list(range(n))),
+                           cat=lambda values: Tensor([x for value in values for x in value.data]))
     monkeypatch.setitem(sys.modules, "torch", fake)
     monkeypatch.setattr(unpad, "_dropouts", lambda model, module: frozenset())
     monkeypatch.delenv("SOUP_UNPAD", raising=False)
@@ -141,15 +169,18 @@ def test_plan_preserves_row_order_and_rejects_supervised_padding(monkeypatch):
     model.rotary_emb = SimpleNamespace(rope_type="default")
     model.layers = [SimpleNamespace(self_attn=object())]
     module = SimpleNamespace(Qwen2Model=Model)
-    mask = Tensor([[1, 1, 1], [1, 0, 0]])
-    ids = Tensor([[5, 6, 7], [8, 0, 0]])
-    labels = Tensor([[-100, 6, 7], [-100, -100, -100]])
+    mask = Tensor([[1, 0, 0], [1, 1, 1]])
+    ids = Tensor([[5, 0, 0], [8, 6, 7]])
+    labels = Tensor([[-100, -100, -100], [-100, 6, 7]])
     token = unpad._LABELS.set((labels, mask))
     try:
         plan = unpad._plan(model, module, ids, mask, None, None, None, False, {})
-        assert plan.lengths == (3, 1) and plan.indices.data == [0, 1, 2, 3]
-        labels.data[1][2] = 9
+        assert plan.lengths == (1, 3) and plan.indices.data == [0, 3, 4, 5]
+        assert len(transfers) == 1
+        assert transfers[0].shape == (7,)  # B*S mask bits plus one validity bit
+        labels.data[0][2] = 9
         assert unpad._plan(model, module, ids, mask, None, None, None, False, {}) is None
+        assert len(transfers) == 2
     finally:
         unpad._LABELS.reset(token)
 
@@ -478,3 +509,160 @@ def test_packed_fused_head_targets_metrics_and_gradients(monkeypatch, denominato
     assert rows[-1] == labels.numel()
     torch.testing.assert_close(fallback_loss, expected_loss.detach(), equal_nan=True, **tolerance)
     torch.testing.assert_close(fallback.token_entropy, expected.token_entropy, **tolerance)
+
+
+def test_scatter_has_one_destination_and_preserves_gradient(runtime, monkeypatch):
+    torch, _, device = runtime
+    lengths, sequence = (1, 4, 2), 4
+    indices = unpad._indices_from_lengths(lengths, sequence, device)
+    assert indices.tolist() == [0, 4, 5, 6, 7, 8, 9]
+    batch = unpad.PackedBatch(3, sequence, 64, lengths, indices, frozenset(), frozenset())
+    x = torch.randn(1, sum(lengths), 64, device=device, requires_grad=True)
+    copies, allocations = [], []
+    native_zeros, native_copy = torch.zeros, torch.Tensor.index_copy_
+    def zeros(*args, **kwargs):
+        out = native_zeros(*args, **kwargs)
+        allocations.append(out.data_ptr())
+        return out
+    def copy(destination, *args, **kwargs):
+        copies.append(destination.data_ptr())
+        return native_copy(destination, *args, **kwargs)
+    monkeypatch.setattr(torch, "zeros", zeros)
+    monkeypatch.setattr(torch.Tensor, "index_copy_", copy)
+    result = unpad._scatter(x, batch)
+    assert copies == allocations == [result.data_ptr()]
+    weights = torch.arange(result.numel(), device=device, dtype=result.dtype).reshape(result.shape)
+    (result * weights).sum().backward()
+    torch.testing.assert_close(x.grad, unpad._pack(weights, batch), rtol=0, atol=0)
+
+
+def _run_joint_acceptance(backend):
+    """Called in a fresh GPU subprocess: no dependence on earlier test patches."""
+    from collections import defaultdict
+    import os
+    import torch
+    import solution
+    import pytest
+
+    os.environ.pop("SOUP_FUSED_DISABLE", None)
+    os.environ["SOUP_FUSED_NORM_FP16"] = "1"
+    os.environ.pop("SOUP_MLP_RECOMPUTE", None)
+    os.environ.pop("SOUP_MLP_OFFLOAD", None)
+    os.environ.pop("SOUP_MLP_RECOMPUTE_LAYERS", None)
+    solution.apply()
+    solution.apply()
+    from transformers.models.qwen2 import modeling_qwen2 as module
+    from trl import SFTTrainer
+    from soup_cli.trainer.rewind_hf import make_rewind_trainer_class
+    from soup_cli.utils.stream_loss_chunk import STEP_ATTR
+    from solution.rope import _MARKER as rope_marker
+    from solution.kernels import cross_entropy as ce, rmsnorm, rope
+
+    assert hasattr(module.apply_rotary_pos_emb, rope_marker)
+    wrapped, raw = _model(torch, module, "cuda", backend)
+    trainer = object.__new__(make_rewind_trainer_class(SFTTrainer))
+    trainer.model = wrapped
+    trainer.accelerator = SimpleNamespace(gather_for_metrics=lambda x: x, parallelism_config=None)
+    trainer.args = SimpleNamespace(use_liger_kernel=False, loss_type="nll",
+                                   average_tokens_across_devices=False, n_gpu=1)
+    trainer.num_virtual_tokens = 0
+    trainer.aux_loss_enabled = False
+    trainer.label_smoother = trainer.compute_loss_func = None
+    trainer.model_accepts_loss_kwargs = True
+    trainer.state = SimpleNamespace(global_step=0)
+    records = []
+    def fail(exc):
+        raise AssertionError("Rewind recorder failed") from exc
+    trainer._soup_rewind_state = SimpleNamespace(
+        failed=False, on_micro_batch=lambda **kw: records.append(kw), fail=fail)
+    ids, labels, mask = _batch(torch, "cuda", (7, 4, 1, 4))
+    denominator = (labels[:, 1:] != -100).sum() + 3
+    initial = torch.cuda.get_rng_state()
+    rows, norm_dtypes, rope_calls = [], [], []
+    native_ce, native_norm, native_rope = ce.fused_linear_cross_entropy, rmsnorm.rms_norm, rope.fused_rope
+    def observed_ce(hidden, weight, targets, ignore_index=-100):
+        rows.append(hidden.shape[0])
+        return native_ce(hidden, weight, targets, ignore_index=ignore_index)
+    def observed_norm(x, weight, eps, out_dtype=None):
+        norm_dtypes.append(out_dtype)
+        return native_norm(x, weight, eps, out_dtype)
+    def observed_rope(*args, **kwargs):
+        rope_calls.append(args[0].shape)
+        return native_rope(*args, **kwargs)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(ce, "fused_linear_cross_entropy", observed_ce)
+        patch.setattr(rmsnorm, "rms_norm", observed_norm)
+        patch.setattr(rope, "fused_rope", observed_rope)
+        saved = []
+        for packed in (False, True):
+            os.environ["SOUP_UNPAD"] = "1" if packed else "0"
+            torch.cuda.set_rng_state(initial)
+            wrapped.zero_grad(set_to_none=True)
+            records.clear()
+            norm_dtypes.clear()
+            rope_calls.clear()
+            trainer._metrics = {mode: defaultdict(list) for mode in ("train", "eval")}
+            trainer._total_train_tokens = 0
+            with torch.autocast("cuda", dtype=torch.float16):
+                loss, outputs = trainer.compute_loss(
+                    wrapped, dict(input_ids=ids, labels=labels, attention_mask=mask),
+                    return_outputs=True, num_items_in_batch=denominator)
+            assert outputs.logits is None
+            step = getattr(trainer, STEP_ATTR)
+            assert step is not None and raw._solution_fused_step is None
+            assert torch.float16 in norm_dtypes and len(rope_calls) == 2
+            assert len(records) == 1 and step.token_loss.shape == labels.shape
+            entropy = trainer._metrics["train"]["entropy"][-1]
+            accuracy = trainer._metrics["train"]["mean_token_accuracy"][-1]
+            tokens = trainer._metrics["train"]["num_tokens"][:]
+            rng = torch.cuda.get_rng_state()
+            loss.mul(128).backward()
+            grads = {name: p.grad.detach().clone() for name, p in wrapped.named_parameters()
+                     if "lora_" in name and p.grad is not None}
+            assert grads and all(torch.isfinite(g).all() for g in grads.values())
+            saved.append((loss.detach(), step.token_loss.detach().clone(),
+                          step.token_entropy.detach().clone(), entropy, accuracy,
+                          tokens, records[0].copy(), rng, grads))
+        expected, actual = saved
+        assert rows == [labels.numel(), sum((7, 4, 1, 4))]
+        for index in (0, 1):
+            torch.testing.assert_close(actual[index], expected[index], rtol=3e-3, atol=3e-3)
+        torch.testing.assert_close(actual[2][mask.bool()], expected[2][mask.bool()], rtol=3e-3, atol=3e-3)
+        assert actual[3] == pytest.approx(expected[3], rel=3e-3, abs=3e-3)
+        assert actual[4:6] == expected[4:6]
+        assert actual[5] == [mask.sum().item()]
+        assert actual[6]["row_tokens"] == expected[6]["row_tokens"]
+        torch.testing.assert_close(torch.tensor(actual[6]["row_loss"]),
+                                   torch.tensor(expected[6]["row_loss"]), rtol=3e-3, atol=3e-3)
+        assert torch.equal(actual[7], expected[7])
+        assert actual[8].keys() == expected[8].keys()
+        for name, grad in actual[8].items():
+            reference = expected[8][name]
+            torch.testing.assert_close(grad, reference, rtol=3e-2, atol=1e-3, msg=name)
+            assert (grad - reference).norm() <= 0.03 * reference.norm() + 2e-6, name
+    assert unpad._ACTIVE.get() is None and unpad._HEAD_CAPTURE.get() is None
+    assert unpad._LABELS.get() is None
+    print(f"joint {backend}: RoPE + fp16 norm + packed CE + TRL/Rewind + LoRA gradients/RNG PASS")
+
+
+@pytest.mark.parametrize("backend", ["dense", "bnb"])
+def test_joint_patches_and_bridge_in_fresh_process(backend):
+    import os
+    from pathlib import Path
+    import subprocess
+
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("joint fused-kernel acceptance needs CUDA")
+    for dependency in ("transformers", "peft", "trl", "soup_cli", "triton"):
+        pytest.importorskip(dependency)
+    if backend == "bnb":
+        pytest.importorskip("bitsandbytes")
+    code = ("from solution.tests.test_unpad import _run_joint_acceptance\n"
+            f"_run_joint_acceptance({backend!r})\n")
+    result = subprocess.run([sys.executable, "-c", code],
+                            cwd=Path(__file__).resolve().parents[2],
+                            env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
+                            capture_output=True, text=True, timeout=240)
+    assert result.returncode == 0, result.stdout + "\n" + result.stderr
+    print(result.stdout)
