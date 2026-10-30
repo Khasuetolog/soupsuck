@@ -2,31 +2,30 @@
 
 Our Triton kernels reduce activation and output-head memory during the fixed
 Qwen2.5-1.5B-Instruct NF4/LoRA training task on a Kaggle Tesla T4.
-The first complete comparison passed all ten harness checks: **70.05 s and
-5,843 MiB**, versus **77.47 s and 14,345 MiB** for base Soup.
+The latest complete development comparison passed all ten harness checks:
+**73.54 s and 5,863 MiB**, versus **82.25 s and 14,345 MiB** for base Soup.
 
 | Measurement | Base Soup | Solution | Comparison |
 | --- | ---: | ---: | --- |
-| Whole `soup train` command | 77.47 s | 70.05 s | 1.1059× speedup |
-| Peak GPU memory, sampled by nvidia-smi | 14,345 MiB | 5,843 MiB | 2.4551× base/solution |
-| Public held-out answer-token loss | 2.04964 | 2.04962 | −0.001% vs base |
-| Own Triton kernel share, steps 3 onward | — | 8.6% | Check 4 PASS |
+| Whole `soup train` command | 82.25 s | 73.54 s | 1.1184× speedup |
+| Peak GPU memory, sampled by nvidia-smi | 14,345 MiB | 5,863 MiB | 2.4467× base/solution |
+| Public held-out answer-token loss | 2.04960 | 2.04969 | +0.004% vs base |
+| Own Triton kernel share, steps 3 onward | — | 12.1% | Check 4 PASS |
 | Harness checks | — | 10/10 PASS | One paired repetition |
 
-**Measured commit:** `de836e0264d24fbd2e184eb853e2bb81bb0f0c11`, seed 1,
-64 training steps on each side. These are development results from **one**
-base/solution pair, not the final two-repeat jury comparison.
-The separate solution test suite reported **171 passed, 1 failed**; the Soup
-regression suite used by check 10 passed all **79** tests. The remaining test
-failure and review findings are described below.
+**Measured commit:** `ce1ff09`, seed 1, 64 training steps on each side.
+These are development results from **one** base/solution pair, not the final
+two-repeat jury comparison. The separate solution suite reported **214 passed,
+4 failed**; check 10 passed all **79** Soup regression tests. Subsequent test
+changes require a new GPU run; all ten checks do not certify the solution suite.
 
 Evidence root, abbreviated **E** throughout this document:
-`runs_kaggle/20261030T105526661826Z_full_de836e0/out/`.
-The summary numbers come from `E/runs/result.json` (`summary`); check outcomes
-from `E/checks.log` and `E/runs/checks.json`; test counts from
-`E/pytest_solution.log` and check 10. `E/source-manifest.json` records the full
-commit and archive hashes. These local development artifacts are excluded from
-Git; the final public notebook must publish the corresponding final evidence.
+`runs_kaggle/20261030T112204781815Z_full_ce1ff09/out/`.
+Summary numbers come from `E/runs/result.json:summary`, checks from
+`E/runs/checks.json`, and tests from `E/pytest_solution.log` and check 10.
+`E/source-manifest.json` records commit/archive hashes. These local development
+artifacts are excluded from Git; the final public notebook must publish final
+evidence. The earlier passing `de836e0` pair remains below as history.
 
 - Public Kaggle notebook, saved version: `<KAGGLE_LINK>`
 - Final submission commit: `<FINAL_COMMIT>`
@@ -35,11 +34,10 @@ Git; the final public notebook must publish the corresponding final evidence.
 ## What we did
 
 The entry point is [`solution.apply()`](solution/__init__.py).
-Implementation registration described here is the committed snapshot
-`8f8ebbc`: it includes the measured `de836e0` implementation, an available,
-unregistered NF4 decoder, and a subsequent CE update. That update uses native
-fp16 logit GEMMs and compacts valid rows in backward. It has not inherited the
-older run's checks or performance results; the table above remains de836e0 only.
+Registration below describes committed HEAD `585de28`. Compared with the measured
+`ce1ff09`, HEAD also registers lossless tied-embedding storage and fused RoPE.
+Their performance and GPU correctness are **not** established by the ce1ff09
+results. No result in this document is presented as a final-HEAD comparison.
 
 ### Frozen linear cross-entropy, entropy and predictions
 
@@ -54,8 +52,8 @@ older run's checks or performance results; the table above remains de836e0 only.
 **Registered:** the Qwen2 labelled-training head and TRL metrics bridge in
 [`solution/patch.py`](solution/patch.py).
 Instead of keeping all `[batch × sequence, vocabulary]` logits, the head visits
-vocabulary chunks. Matrix multiplication remains `torch.mm`/cuBLAS. Current
-8f8ebbc uses fp16 operands and native fp16 logit output, then promotes logits
+vocabulary chunks. Matrix multiplication remains `torch.mm`/cuBLAS. The registered implementation
+uses fp16 operands and native fp16 logit output, then promotes logits
 to fp32 for statistics, following the baseline bias-free AMP linear operation
 without changing backend reduction flags. Measured de836e0 instead used fp32
 GEMM output followed by explicit fp16 rounding; these two GEMM paths need not
@@ -80,7 +78,7 @@ row with `pad(labels, (0, 1), -100)[..., 1:]`. Ignored targets have zero per-tok
 loss; the final position of each row is ignored. The scalar loss is the sum
 normalized by the supplied `num_items_in_batch`, or the valid-target count.
 
-Backward recomputes chunk logits rather than saving them. Current 8f8ebbc
+Backward recomputes chunk logits rather than saving them. The registered backward
 selects valid-target rows before the backward GEMMs, then scatters dX into a
 zero-filled full output; with no valid targets it returns zero dX immediately.
 Forward still computes entropy and predictions for every position. Compaction
@@ -91,8 +89,9 @@ fp16 for GEMM, accumulates dX in fp32, and multiplies by
 underflow; it does not promise bitwise equality with baseline fp16 dZ.
 The frozen head has no weight gradient. Excluding ignored rows before gain
 computation removes the reviewed ignored-row `0 * inf` gradient path in 8f8ebbc;
-new GPU tests and paired measurements are still required. Zero-denominator
-training loss retains baseline NaN semantics.
+the ce1ff09 paired checks pass, while the dedicated edge-case tests must also
+be checked in the final suite. Zero-denominator training loss retains baseline
+NaN semantics.
 
 ### Qwen2 RMSNorm
 
@@ -118,6 +117,18 @@ For incoming gradient `g`, input backward uses
 Weight gradients use independent partial tiles and a final reduction, without
 atomics. Batch-dependent sizes and strides are runtime arguments.
 
+`out_dtype=torch.float16` writes the final promoted result rounded to half in
+the same pass. Input norms use explicit decoder scopes and require fp16 CUDA
+AMP plus certified q/k/v consumers. For PEFT q/v, the registered vanilla LoRA
+fp16-ingress path must be ready; k uses its certified dense/bnb path. The final
+norm is scoped by the causal head and requires a certified ordinary dense head
+under fp16 AMP. Unsupported wrappers, hooks or consumers keep the original
+promoted norm output. A custom embedding/head forward can conservatively disable
+the final-norm half optimization. Standalone norms have no half-output scope.
+Backward returns dX in the input dtype and retains the original promoted dtype
+for the optional norm-weight gradient. Early half output changes rounding and
+shared-branch gradient accumulation; it is not bitwise-equivalent training.
+
 ### Attention residual add + post-attention RMSNorm
 
 [`solution/kernels/add_rmsnorm.py`](solution/kernels/add_rmsnorm.py) defines
@@ -134,8 +145,8 @@ It retains `s`, the weight reference and one fp32 reciprocal RMS per row.
 By default, this post-attention norm writes fp16 output to reduce activation
 storage before the frozen fp16 MLP projections. The residual stream remains in
 its original promoted dtype. This is a precision optimization, not a promise
-of bitwise end-to-end equivalence. The documented snapshot has an insufficient
-consumer guard for ordinary fp32 MLPs outside AMP; see Limitations.
+of bitwise end-to-end equivalence. The consumer guard now requires certified half projections and keeps the
+original promoted dtype for a dense fp32 MLP outside AMP (review P1-2).
 
 ### LoRA scale/add epilogue and fp16 ingress
 
@@ -154,8 +165,9 @@ For fp16 ingress it promotes the activation to fp32 before dropout, preserving
 its dispatch shape and RNG advancement relative to the aligned fp32 path;
 it does not recover values lost by earlier fp16 rounding. Dropout is still
 called once, after the base projection, with the original probability/order.
-The measured snapshot keeps the attention input norm output fp32: fp16 ingress
-support is available but was not a separate measured optimization. Mixed
+The current default enables eligible attention input norms to write half,
+using this ingress path for q/v adapters. Preserved masks/RNG do not imply
+equal dropout values or equal adapter/input gradients after early rounding. Mixed
 adapters, variants and unsupported states use original PEFT.
 
 ### Frozen MLP with tiled SwiGLU and optional recomputation
@@ -186,30 +198,67 @@ context during backward. It adds projection work in exchange for lower retained
 activation memory. Local GradientEdges preserve projection backward without
 retaining the entire activation buffer as a tensor leaf. Frozen, supported
 projection types qualify; trainable projections, hooks and wrappers fall back.
-Only first-order gradients are implemented. Recompute was not used for the
-summary result and has no claimed end-to-end speed or memory result here.
+Only first-order gradients are implemented. Recompute was not used for the summary result. Its separate paired measurement
+is reported below; store remains the default.
 
-### NF4 decoder: available, not registered in the measured/default entry point
+### NF4 decoder
 
 [`solution/kernels/nf4.py`](solution/kernels/nf4.py) defines `nf4_decode_kernel`.
-[`solution/nf4_patch.py`](solution/nf4_patch.py) provides `patch_bnb_dequant` for
-the bitsandbytes functional and CUDA backend dequantization paths, but committed
-`solution/patch.py` does **not** call it. It was added after measured `de836e0`.
-It has no claimed measured share or contribution to the summary result.
+**Registered:** [`solution/nf4_patch.py`](solution/nf4_patch.py) patches the
+bitsandbytes functional and CUDA backend dequantization paths after their
+post-import dependencies are ready. The exact bitsandbytes version gate is
+0.50.2. NF4 was active in measured ce1ff09 and contributes to its own-kernel share.
+The 4-bit matrix multiplication itself remains a library operation.
 
-The narrow supported format is fp16 NF4, block size 64, with double-quantized
+The supported nested format is fp16 NF4, block size 64, with double-quantized
 scales in blocks of 256. Earlier values occupy the high nibble of each byte.
 For output index `i`, nested scale reconstruction is
 `scale = fp32(code2[qabs[i//64]] * absmax2[(i//64)//256]) + offset`;
-output is `fp16(NF4[nibble(i)] * scale)`. A second variant accepts already decoded
-fp32 scales. FMA fusion is disabled to preserve the intermediate scale rounding.
-Format constants are data; the decoder implementation is our own. GPU equality
-and integration must be validated before activating it in a final submission.
+output is `fp16(NF4[nibble(i)] * scale)`. A second variant accepts decoded
+fp32 scales, including non-nested functional calls routed through the patched
+backend. FMA fusion is disabled to preserve intermediate scale rounding.
+Unsupported versions, formats, devices and layouts use the original paths.
+Review notes an extra allocation/copy for supported functional `out=` calls.
+
+### Lossless storage of the tied embedding/head
+
+[`solution/embedding.py`](solution/embedding.py) is **registered** after Soup's
+`SFTTrainerWrapper._setup_transformers`. It accepts only an eligible frozen,
+tied Qwen2 embedding/head after PEFT setup, with unchanged LoRA-only saving.
+Every table element must satisfy `half_weight.float() == original_weight`;
+the check is chunked and conversion is declined if any element fails.
+The existing shared Parameter, tying, dimensions and names are preserved.
+No new Triton kernel is introduced.
+
+Only the table's storage becomes half. Embedding lookup is restored to the
+original fp32 output; the dense head uses the same represented weights under
+AMP. Outside AMP it temporarily reconstructs fp32 weights, so this optimization
+does not promise lower eval peak memory. It was registered after ce1ff09:
+no separate measured memory or speed gain is claimed here.
+
+### Fused q/k rotary position embedding
+
+[`solution/kernels/rope.py`](solution/kernels/rope.py) defines
+`rope_pair_forward_kernel` and `rope_pair_backward_kernel`.
+**Registered:** [`solution/rope.py`](solution/rope.py) replaces Qwen2's module-global
+`apply_rotary_pos_emb`, which attention resolves at call time. It combines q/k
+rotation, products and sum, preserving PyTorch type promotion and separate
+product-rounding boundaries rather than using a fused multiply-add.
+For the two half-head slices, backward computes
+`dx1 = g1*cos1 + g2*sin2`, `dx2 = g2*cos2 - g1*sin1`, with cast boundaries
+matching the original graph. Only cos/sin and metadata are saved.
+
+The fast path supports even head dimensions, supported CUDA fp16/fp32 tensors,
+`unsqueeze_dim=1` and non-trainable cos/sin. Other cases use plain PyTorch math;
+no optional hub kernel is requested or called, including on fallback.
+Sequence size is a runtime argument. RoPE was added after ce1ff09 and has no
+measured share in that run; final GPU tests and profiling remain required.
 
 ## How it plugs in
 
 The unmodified harness calls `solution.apply()` before Soup builds its model.
-Targeted post-import hooks patch Qwen2, TRL SFTTrainer and PEFT's bnb LoRA class
+Targeted post-import hooks patch Qwen2, TRL SFTTrainer, PEFT's bnb LoRA class,
+bitsandbytes dequantization and Soup model setup
 before the importing caller receives the module. Already loaded modules are
 handled too; markers make repeated installation idempotent. Cold registration
 does not import/compile the CUDA kernels or eagerly import the training stack.
@@ -220,7 +269,7 @@ inputs and the fp16 head precision path. Unsupported loss options, custom loss,
 label smoothing, virtual tokens, parallelism or logit selection use the
 original head/trainer path. CPU, fake test modules and unsupported tensor
 layouts use guarded fallbacks. Eval/generation return ordinary logits; other
-eligible layer patches can still run, subject to the limitation below.
+eligible layer patches can still run, subject to their own precision guards.
 
 The TRL bridge keeps the same metric names and formulas: entropy uses all
 attention-mask tokens; accuracy uses shifted non-ignored labels; num_tokens
@@ -232,7 +281,7 @@ by the unmodified external evaluator without importing solution.
 | Experimental environment flag | Submitted default behavior in the documented snapshot | Override for comparison |
 | --- | --- | --- |
 | `SOUP_FUSED_DISABLE` | Unset: registered optimizations enabled | `1`: use their original paths |
-| `SOUP_FUSED_NORM_FP16` | Unset: post-attention norm output fp16 | `0`: original promoted norm-output dtype |
+| `SOUP_FUSED_NORM_FP16` | Unset: eligible input, post-attention and final norm outputs fp16 | `0`: original promoted norm-output dtype |
 | `SOUP_MLP_RECOMPUTE` | Unset: store gate/up | `1`: recompute gate/up in backward |
 
 Final measurements must use defaults with these overrides unset. Flags are for
@@ -275,8 +324,8 @@ python harness/score.py runs/result.json
 
 The measured runtime was Python 3.13.15, torch 2.11.0+cu128, Triton 3.6.0 and
 Tesla T4 driver 580.178.04, with the package versions above; source:
-`E/runs/result.json:versions`. The head relies on CUDA `torch.mm` support for
-`out_dtype=torch.float32`. A different runtime must be validated.
+`E/runs/result.json:versions`. The head's backward relies on CUDA `torch.mm` support for
+`out_dtype=torch.float32`; its forward logits use fp16 GEMM output. A different runtime must be validated.
 The harness sets the allocator and restricts training to one GPU; do not
 substitute a different allocator or prepopulate compiler caches.
 
@@ -303,37 +352,76 @@ This private iteration notebook does not replace the public submission link.
 
 ## Results and kernel-time accounting
 
-The summary is the first full passing run, **one repeat at de836e0**.
-`E/runs/base_1/metrics.json` reports 64 steps, training loop 53.42 s and
-median step 0.8478 s; `E/runs/solution_1/metrics.json` reports 64 steps,
-training loop 47.59 s and median step 0.6429 s.
-Whole-command timing includes startup, cold compilation and saving the adapter.
+The latest passing pair is **one repeat at ce1ff09**. Base metrics report a
+57.51 s training loop and 0.9107 s median step; solution reports 51.52 s and
+0.6868 s. Whole-command timing includes startup, cold compilation and saving.
 
-Shares below are **training-time shares**, not percentages of total GPU kernel
-time and not whole-command shares. The solution's timed steps 3–64 total
-**39.556 s**. Each share is `100 * own_kernel_ms[name] / (1000 * timed_loop_s)`
-from `E/runs/solution_1/metrics.json`. Base metrics have no own kernels.
+| Passing development pair | Base / solution wall, s | Base / solution peak, MiB | Base / solution eval loss | Speedup / memory ratio | Own share | Checks |
+| --- | --- | --- | --- | --- | --- | --- |
+| de836e0 (history) | 77.47 / 70.05 | 14,345 / 5,843 | 2.04964 / 2.04962 | 1.1059 / 2.4551 | 8.6% | 10/10 |
+| ce1ff09 (latest) | 82.25 / 73.54 | 14,345 / 5,863 | 2.04960 / 2.04969 | 1.1184 / 2.4467 | 12.1% | 10/10 |
+
+Historical evidence:
+`runs_kaggle/20261030T105526661826Z_full_de836e0/out/runs/result.json`.
+These pairs ran on different sessions; their difference is not an isolated
+measurement of any single optimization.
+
+Shares below are training-time shares, not percentages of GPU kernel time or
+whole-command shares. Timed solution steps 3–64 total **43.035 s**.
+Each share is `100 * own_kernel_ms[name] / (1000 * timed_loop_s)` from
+`E/runs/solution_1/metrics.json`. Base has no own kernels.
 
 | Kernel | CUDA-event time, ms | Share of timed training |
 | --- | ---: | ---: |
-| `rmsnorm_forward_kernel` | 144.228 | 0.3646% |
-| `rmsnorm_input_gradient_kernel` | 194.386 | 0.4914% |
-| `add_rmsnorm_forward_kernel` | 213.710 | 0.5403% |
-| `add_rmsnorm_backward_kernel` | 254.252 | 0.6428% |
-| `lora_scale_add_kernel` | 212.380 | 0.5369% |
-| `lora_scale_gradient_kernel` | 108.677 | 0.2747% |
-| `vocabulary_statistics_kernel` | 273.461 | 0.6913% |
-| `vocabulary_outputs_kernel` | 0.637 | 0.0016% |
-| `vocabulary_derivative_kernel` | 328.581 | 0.8307% |
-| `swiglu_tile_engine` (both variants) | 1659.851 | 4.1962% |
-| **Total counted own kernels** | **3390.163** | **8.5705%** |
+| `rmsnorm_forward_kernel` | 119.613 | 0.2779% |
+| `rmsnorm_input_gradient_kernel` | 165.313 | 0.3841% |
+| `add_rmsnorm_forward_kernel` | 222.172 | 0.5163% |
+| `add_rmsnorm_backward_kernel` | 254.163 | 0.5906% |
+| `lora_scale_add_kernel` | 148.014 | 0.3439% |
+| `lora_scale_gradient_kernel` | 84.083 | 0.1954% |
+| `vocabulary_statistics_kernel` | 262.717 | 0.6105% |
+| `vocabulary_outputs_kernel` | 0.725 | 0.0017% |
+| `vocabulary_derivative_kernel` | 112.667 | 0.2618% |
+| `swiglu_tile_engine` | 1709.047 | 3.9713% |
+| `nf4_decode_kernel` | 2148.202 | 4.9918% |
+| **Total counted own kernels** | **5226.716** | **12.1453%** |
 
-Optional `rmsnorm_weight_partials_kernel` and `rmsnorm_weight_finalize_kernel`
-are absent from the launch/time maps because norms are frozen. `nf4_decode_kernel`
-is absent because it was not installed in this run. The example kernels were
-not launched by the registered MLP. No cuBLAS or other library kernel time is
-added to our share. Check 4 reports the rounded total **8.6%**, against its 5%
-threshold; the jury uses the lowest eligible share across solution repetitions.
+Frozen norm weights mean the two optional norm-weight-gradient kernels are
+absent. RoPE and tied-embedding storage were not registered in ce1ff09; they
+receive no measured credit here. No `example_*`, cuBLAS or other library kernel
+time is counted. Check 4 rounds to 12.1%; final scoring uses the lowest eligible
+share across solution repetitions.
+
+### Precision and memory experiments
+
+| Snapshot / setting | Solution wall, s | Peak, MiB | Median step, s | Eval loss |
+| --- | ---: | ---: | ---: | ---: |
+| 0e12e01, original post-attention norm dtype | 89.81 | 8,003 | 0.8215 | 2.04967 |
+| 0e12e01, `SOUP_FUSED_NORM_FP16=1` | 76.64 | 5,843 | 0.7188 | 2.04966 |
+
+Evidence directories under `runs_kaggle/`:
+`20261030T104335675818Z_solution_0e12e01_default/out/` and
+`20261030T104354956814Z_solution_0e12e01_e4e1167_fp16norm/out/`
+(`runs_try/result.json` and `solution_1/metrics.json`). These solution-only
+experiments motivated the post-attention half default; they do not isolate
+later input/final norm compression or prove exact LoRA equivalence.
+
+| MLP experiment | Solution wall / loop, s | Peak, MiB | Eval loss | Paired speedup / memory ratio |
+| --- | --- | ---: | ---: | --- |
+| 8f8ebbc store | 79.57 / 47.05 | 5,843 | 2.04966 | Solution only |
+| 8f8ebbc recompute | 86.39 / 53.63 | 4,143 | 2.04966 | Solution only |
+| ce1ff09 store (default) | 73.54 / 51.52 | 5,863 | 2.04969 | 1.1184 / 2.4467 |
+| ce1ff09 recompute | 93.95 / 67.82 | 4,123 | 2.04968 | 1.0404 / 3.4793 |
+
+8f8ebbc evidence: `runs_kaggle/20261030T111238818312Z_solution_8f8ebbc_store/out/`
+and `20261030T111258418092Z_solution_8f8ebbc_eb596ed_recompute/out/`.
+Recompute paired evidence:
+`runs_kaggle/20261030T112337362378Z_full_ce1ff09_eb596ed_recompute/out/runs/result.json`.
+Its base was 97.75 s, 14,345 MiB, eval loss 2.04964; all ten checks passed and
+own share was 10.6%. The extra projection work reduces memory but its speedup
+is below the score's 1.05 threshold. **Store remains the default.** Separate
+sessions have different base timings; memory and speed ratios use each pair's
+own base rather than mixing sessions.
 
 | Final two-repeat comparison | Value |
 | --- | --- |
@@ -354,25 +442,33 @@ T4/fp16. bf16, trainable heads, higher-order derivatives and unsupported model o
 trainer features are outside that fast path. Layer fallbacks are separate from
 the head fallback and need their own precision validation.
 
-The implementation does not replace attention or the NF4 matrix-multiplication
-kernels; projection GEMMs remain library operations. The NF4 decoder is present
-but unregistered. Chunked CE still performs GEMMs and Python chunk iteration;
-MLP recomputation adds projection work. Kaggle machines vary, so one pair is not
-a guarantee of the same speedup on another host, seed or hidden rows.
+Attention matmul/softmax and NF4 matrix multiplication remain library
+operations; only rotary position application and NF4 decoding are replaced.
+Chunked CE still performs library GEMMs and Python chunk iteration. Cold
+compilation and setup count toward wall time. Lossless embedding conversion
+requires an exact half roundtrip and may decline on another checkpoint.
+RoPE and embedding registration postdate the latest full comparison.
 
-[Independent review](tasks/REVIEW.md), scoped to de836e0, recorded:
+[Independent review](tasks/REVIEW.md) contains S-017, S-021 and S-023:
 
-| Finding | Status of the documented/measured snapshot |
+| Finding | Current status / evidence boundary |
 | --- | --- |
-| Own-kernel share previously below 5% | Resolved for this one measured pair: check 4 PASS at 8.6%; final two-repeat/hidden-row evidence still required |
-| Fully ignored batch / nonfinite upstream can produce NaN dX through `0 * gain` | Present in measured de836e0; 8f8ebbc excludes ignored rows before backward gain/GEMMs and adds regression tests, with GPU validation still pending |
-| fp16 post-attention output can reach fp32 MLP without AMP | Open and reproduced by `test_bridge_without_amp_preserves_dense_fallback`, the one failing solution test in this run |
-| README still described the starter kit | Replaced by this document; final links/results remain placeholders |
+| P0-1: own share below 5% | Both de836e0 and ce1ff09 full pairs pass check 4; ce1ff09 is 12.1%. Final two-repeat evidence remains pending. |
+| P1-1: all-ignored/nonfinite upstream can produce NaN dX | Closed in code by S-018: backward exits before gain/GEMMs if no valid targets and excludes ignored rows otherwise. S-021 confirms the structure; final dedicated tests still required. |
+| P1-2: half norm reaches dense fp32 MLP outside AMP | Closed statically in S-016/S-023 by consumer guards; unsupported MLP keeps the promoted dtype. |
+| P1-023-1: input-norm half changes LoRA values and shared-gradient accumulation | Numerical limitation remains. ce1ff09 checks 5–7 pass for one public pair; this does not prove equality or hidden-row/seed robustness. Dropout masks/RNG alone do not establish numerical equivalence. |
+| P2-021-1: functional NF4 `out=` allocation/copy | Remains a performance limitation; alias result is preserved. |
+| P2-021-2: functional non-nested NF4 can reach own flat backend | Documented routing; unsupported-format fallback does not mean all non-nested calls avoid our kernel. |
+| P2-021-3: chunk CE equality test is not whole-head bitwise proof | Remains a test-scope limitation. cuBLAS algorithms can differ with GEMM shape. |
+| P2-1: description/reproducibility | Updated here; final links, final commit and two-repeat result remain pending. |
 
-Do not describe the separate solution test suite as fully passing merely because
-all ten harness checks passed. Check 10 runs Soup's regression tests, not the
-solution suite. The 8f8ebbc CE fix and broader norm precision changes require new paired
-measurements. The review does not certify NF4, which was added later.
+The ce1ff09 solution suite had four failures: a stale fake-MLP dtype expectation,
+an input/final half-norm gradient comparison, and two strict random half-store
+RMSNorm comparisons. Subsequent test changes at 585de28 distinguish the guarded
+fallback, rounding-boundary behavior and contraction tolerances. They are not a
+new passing GPU log. Require a fresh complete solution suite and paired run of
+the final commit before submission. Unpadding (S-024) and MLP offload (S-025)
+are in progress and are not claimed as accepted features or measured gains.
 
 ## Challenge rules retained
 
