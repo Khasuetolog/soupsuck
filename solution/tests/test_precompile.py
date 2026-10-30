@@ -47,11 +47,26 @@ def test_plans_cover_production_kernels_and_bind_real_signatures():
         assert len(plan.args) <= len(names)
         assert set(names[len(plan.args):]) == set(plan.options).intersection(names)
         assert not set(names[:len(plan.args)]).intersection(plan.options)
-        assert plan.options['num_warps'] == 4
+        assert plan.options.get('num_warps', 4) == 4
         found.add(plan.kernel)
     assert found == expected
     assert any(p.kernel == 'vocabulary_statistics_kernel' and p.args[4] == 384
                and p.args[-1] == 512 for p in plans())
+
+
+def test_compiler_options_match_production_presence_and_insertion_order():
+    from solution.precompile import plans
+
+    for plan in plans():
+        keys = tuple(k for k in plan.options if k in ('num_warps', 'enable_fp_fusion'))
+        if plan.kernel == 'vocabulary_statistics_kernel':
+            assert keys == ('num_warps',)  # implicit backend fusion default
+        elif plan.kernel.startswith('vocabulary_'):
+            assert keys == ()  # derivative/output omit BOTH compiler defaults
+        elif plan.kernel.startswith('lora_scale_'):
+            assert keys == ('enable_fp_fusion',)  # implicit backend warp default
+        else:
+            assert keys == ('num_warps', 'enable_fp_fusion')
 
 
 def test_start_is_literal_opt_in_and_idempotent(monkeypatch):
@@ -115,8 +130,16 @@ def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip('CUDA required')
     triton = pytest.importorskip('triton')
+    import importlib
     import solution.precompile as prep
-    from tools.kaggle.bench_kernels import cases, bitwise
+    from triton.runtime.jit import compute_cache_key
+    from solution.kernels.cross_entropy import fused_linear_cross_entropy
+    from solution.kernels.rmsnorm import rms_norm
+    from solution.kernels.add_rmsnorm import add_rms_norm
+    from solution.kernels.swiglu_fused import swiglu_fused_forward, swiglu_fused_backward
+    from solution.kernels.lora_epilogue import lora_epilogue
+    from solution.kernels.nf4 import dequantize_nf4, _dequantize_flat_into
+    from solution.kernels.rope import fused_rope
 
     monkeypatch.setenv('SOUP_EXP_PRECOMPILE', '1')
     monkeypatch.setenv('SOUP_MLP_OFFLOAD', '0')
@@ -128,44 +151,140 @@ def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch):
     assert not state['alive'] and not state['errors'], state
     assert state['compiled'] == len(prep.plans())
     device = torch.cuda.current_device()
+    kernels = {p.kernel: getattr(importlib.import_module(p.module), p.kernel) for p in prep.plans()}
     seen = set()
-    for case in cases(torch, triton, (800,)):
-        name = case.kernel.__name__
-        if name in seen:
-            continue
-        seen.add(name)
-        # The offline sweep forces FMA off for every case. CE production
-        # leaves its default True; test the exact production option here.
-        config = dict(case.baseline)
-        fusion = name.startswith('vocabulary_')
-        def launch():
-            if case.reset is not None:
-                case.reset()
-            case.kernel[case.grid(config)](*case.args, **(case.fixed or {}), **config,
-                                          enable_fp_fusion=fusion)
-        cache = case.kernel.device_caches[device][0]
-        before = set(cache)
-        launch()
+    active = [True]
+    touched = set()
+    case_name = ['']
+
+    def check_hook(name, kernel):
+        def hook(*args, **kwargs):
+            if not active[0]:
+                return
+            cache, key_cache, _, _, binder = kernel.device_caches[device]
+            _, specialization, options = binder(*args, **kwargs)
+            key = compute_cache_key(key_cache, specialization, options)
+            # Hook runs inside real JIT.run AFTER debug/instrumentation kwargs
+            # are added, and BEFORE cache lookup. No hand-coded D/==1 guesses.
+            assert key in cache, (f'precompile missed {case_name[0]} / {name}: '
+                                  f'specialization={specialization!r}, options={options!r}; '
+                                  f'prepared_keys={tuple(cache)!r}')
+            seen.add(name)
+            touched.add(name)
+        return hook
+
+    for name, kernel in kernels.items():
+        monkeypatch.setattr(kernel, 'pre_run_hooks',
+                            list(kernel.pre_run_hooks) + [check_hook(name, kernel)])
+
+    def compare(name, run):
+        case_name[0] = name
+        touched.clear()
+        prepared = {k: dict(v.device_caches[device][0]) for k, v in kernels.items()}
+        actual = tuple(v.detach().clone() for v in run())
         torch.cuda.synchronize()
-        assert set(cache) == before, f'precompile missed first real {case.key}'
-        expected = tuple(t.clone() for t in case.outputs)
-        # Compare against an ordinary first call with no in-process entry.
-        # The current run's disk cache is allowed, but no binary is launched
-        # until this real call. warmup must restore the same in-process keys.
-        cache.clear()
-        launch()
-        torch.cuda.synchronize()
-        assert bitwise(torch, case.outputs, expected) == [0] * len(expected)
-        cache.clear()
-        for plan in prep.plans():
-            if plan.kernel == name:
-                prep.warmup_plan(plan)
-        before = set(cache)
-        launch()
-        torch.cuda.synchronize()
-        assert set(cache) == before
-        assert bitwise(torch, case.outputs, expected) == [0] * len(expected)
-    assert seen == {p.kernel for p in prep.plans()}
+        called = set(touched)
+        assert called, name
+        active[0] = False
+        try:
+            for k in called:
+                kernels[k].device_caches[device][0].clear()
+            expected = run()  # unchanged production path, ordinary first JIT call
+            torch.cuda.synchronize()
+            for got, ref in zip(actual, expected, strict=True):
+                assert torch.equal(got.contiguous().view(torch.uint8),
+                                   ref.detach().contiguous().view(torch.uint8)), name
+        finally:
+            for k in called:
+                cache = kernels[k].device_caches[device][0]
+                cache.clear()
+                cache.update(prepared[k])
+            active[0] = True
+
+    def random(*shape, dtype=torch.float32):
+        return torch.randn(shape, device='cuda', dtype=dtype)
+
+    # Aligned, nonaligned and maximum training row counts. Every launch is
+    # issued by its production wrapper, including omitted default options and
+    # exact dummy-pointer dtypes; no kernel is excluded after its first case.
+    for n in (800, 801, 2048):
+        x, w, delta = random(n, 1536), random(1536), random(n, 1536, dtype=torch.float16)
+        for out_dtype in (None, torch.float16):
+            gy = random(n, 1536, dtype=out_dtype or torch.float32)
+            gs = random(n, 1536)
+            def norm_run():
+                xx, ww = x.clone().requires_grad_(), w.clone().requires_grad_()
+                y = rms_norm(xx, ww, 1e-6, out_dtype)
+                y.backward(gy)
+                return y, xx.grad, ww.grad
+            compare(f'rms/N{n}/{out_dtype}', norm_run)
+            def add_run():
+                xx, dd, ww = (x.clone().requires_grad_(), delta.clone().requires_grad_(),
+                              w.clone().requires_grad_())
+                s, y = add_rms_norm(xx, dd, ww, 1e-6, out_dtype)
+                torch.autograd.backward((s, y), (gs, gy))
+                return s, y, xx.grad, dd.grad, ww.grad
+            compare(f'add-rms/N{n}/{out_dtype}', add_run)
+        def first_add_run():
+            dd = delta.clone().requires_grad_()
+            s, y = add_rms_norm(x, dd, w, 1e-6, torch.float16)
+            torch.autograd.backward((s, y), (gs, gy))
+            return s, y, dd.grad
+        compare(f'add-rms-first-frozen-residual/N{n}', first_add_run)
+        for dtype in (torch.float16, torch.float32):
+            g, u, da = (random(n, 8960, dtype=dtype) for _ in range(3))
+            def swiglu_run():
+                y = swiglu_fused_forward(g, u)
+                dg, du = swiglu_fused_backward(g.half(), u.half(), da, dtype, dtype)
+                return y, dg, du
+            compare(f'swiglu/N{n}/{dtype}', swiglu_run)
+            base, adapter = random(n, 1536, dtype=dtype), random(n, 1536, dtype=torch.float16)
+            upstream = random(n, 1536, dtype=dtype)
+            for cast in (False, True):
+                def lora_run():
+                    bb, aa = base.clone().requires_grad_(), adapter.clone().requires_grad_()
+                    y = lora_epilogue(bb, aa, 2.0, cast_to_result=cast)
+                    y.backward(upstream)
+                    return y, bb.grad, aa.grad
+                compare(f'lora/N{n}/{dtype}/cast{cast}', lora_run)
+        for b in (1, 4):
+            for dtype, ctype in ((torch.float16, torch.float32),
+                                 (torch.float16, torch.float16),
+                                 (torch.float32, torch.float32)):
+                q = random(b, n, 12, 128, dtype=dtype).transpose(1, 2)
+                k = random(b, n, 2, 128, dtype=dtype).transpose(1, 2)
+                c, s = random(b, n, 128, dtype=ctype), random(b, n, 128, dtype=ctype)
+                gdtype = torch.promote_types(dtype, ctype)
+                gq, gk = random(*q.shape, dtype=gdtype), random(*k.shape, dtype=gdtype)
+                def rope_run():
+                    qq, kk = q.detach().requires_grad_(), k.detach().requires_grad_()
+                    yq, yk = fused_rope(qq, kk, c, s)
+                    torch.autograd.backward((yq, yk), (gq, gk))
+                    return yq, yk, qq.grad, kk.grad
+                compare(f'rope/B{b}/T{n}/{dtype}/{ctype}', rope_run)
+        head = random(151936, 1536, dtype=torch.float16)
+        targets = torch.arange(n, device='cuda') % 151936
+        targets[::3] = -100
+        upstream_ce = random(n) / n
+        def ce_run():
+            xx = x.clone().requires_grad_()
+            outputs = fused_linear_cross_entropy(xx, head, targets)
+            outputs[0].backward(upstream_ce)
+            return (*outputs, xx.grad)
+        compare(f'CE/N{n}/V151936/full+tail+compact-bwd', ce_run)
+        del head
+
+    import bitsandbytes as bnb
+    for shape in ((1536, 1536), (8960, 1536), (1536, 8960), (256, 1536)):
+        packed, quant = bnb.functional.quantize_4bit(random(*shape, dtype=torch.float16),
+            quant_type='nf4', compress_statistics=True, blocksize=64)
+        flat = bnb.functional.dequantize_blockwise(quant.absmax, quant.state2) + quant.offset
+        def nf4_run():
+            nested = dequantize_nf4(packed, quant)
+            out = torch.empty(shape, device='cuda', dtype=torch.float16)
+            return nested, _dequantize_flat_into(packed, flat, out)
+        compare(f'NF4/{shape}/nested+flat', nf4_run)
+    assert seen == set(kernels)
 
 
 def test_prepared_pinned_storage_preserves_offload_outputs_and_gradients(monkeypatch):

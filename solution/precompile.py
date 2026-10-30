@@ -22,8 +22,11 @@ training/kernel errors still propagate from the unchanged production path.
 """
 
 from dataclasses import dataclass
+import ast
+from functools import lru_cache
 import importlib
 import os
+from pathlib import Path
 import sys
 import threading
 import time
@@ -37,6 +40,38 @@ class Plan:
     options: dict
 
 
+@lru_cache(None)
+def _launcher_options(module, kernel):
+    """Read ordered compiler keywords from the actual production launch sites.
+
+    Triton 3.6 compute_cache_key uses str(options), including insertion order
+    and explicitly passed defaults. In particular CE omits enable_fp_fusion,
+    and LoRA omits num_warps. Backend-equivalent options are NOT cache-equal.
+    Kernel constexpr kwargs are bound separately and aren't compiler options.
+    """
+    path = Path(__file__).parent / 'kernels' / (module + '.py')
+    tree = ast.parse(path.read_text())
+    definition = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == kernel)
+    parameters = {p.arg for p in definition.args.args}
+    sites = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Subscript)
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == kernel):
+            keywords = []
+            for kw in node.keywords:
+                if kw.arg is None:
+                    raise RuntimeError(f'{kernel}: dynamic launch keywords need explicit support')
+                if kw.arg not in parameters:
+                    # Values like num_warps=warps are resolved by the known
+                    # H1536/BLOCK2048 plan; literals come directly from source.
+                    value = ast.literal_eval(kw.value) if isinstance(kw.value, ast.Constant) else None
+                    keywords.append((kw.arg, value))
+            sites.append(tuple(keywords))
+    if not sites or any(site != sites[0] for site in sites):
+        raise RuntimeError(f'{kernel}: no unique production compiler-option sequence')
+    return sites[0]
+
+
 def plans():
     """Shape-only descriptors; safe to enumerate without torch, Triton or CUDA."""
     f, h, i, u = '*float32', '*float16', '*int64', '*uint8'
@@ -45,7 +80,14 @@ def plans():
     def add(module, kernel, args, **options):
         options.setdefault('num_warps', 4)
         options.setdefault('enable_fp_fusion', False)
-        result.append(Plan('solution.kernels.' + module, kernel, tuple(args), options))
+        compile_options = _launcher_options(module, kernel)
+        compiler_names = {'num_warps', 'enable_fp_fusion'}
+        # Preserve kernel kwargs (e.g. BACKWARD), then source compiler keyword
+        # order. JIT's binder removes kernel kwargs before constructing its key.
+        exact = {k: v for k, v in options.items() if k not in compiler_names}
+        for key, literal in compile_options:
+            exact[key] = options[key] if literal is None else literal
+        result.append(Plan('solution.kernels.' + module, kernel, tuple(args), exact))
 
     # Frozen gamma in training; optional dgamma entries cover all own JITs too.
     for output in (f, h):
@@ -61,10 +103,11 @@ def plans():
                  1536, 2048, True, True, need_r, True))
 
     for n in (800, 801):
-        add('rmsnorm', 'rmsnorm_weight_partials_kernel',
-            (f, h, f, f, n, 1536, 1536, 1, 1536, False, 32, 128))
+        for grad_type in (h, f):
+            add('rmsnorm', 'rmsnorm_weight_partials_kernel',
+                (f, grad_type, f, f, n, 1536, 1536, 1, 1536, False, 32, 128))
         add('cross_entropy', 'vocabulary_outputs_kernel',
-            (f, i, f, f, f, n, -100, 256), enable_fp_fusion=True)
+            (f, i, f, f, f, n, -100, 256))
         for dtype in (h, f):
             for backward in (False, True):
                 source = h if backward else dtype
@@ -96,11 +139,11 @@ def plans():
     # (4096 and the 384 tail) and Start=0/4096 share alignment classes.
     for first in (False, True):
         add('cross_entropy', 'vocabulary_statistics_kernel',
-            (h, i, f, i, 4096, 0, -100, first, 4096), enable_fp_fusion=True)
+            (h, i, f, i, 4096, 0 if first else 4096, -100, first, 4096))
     add('cross_entropy', 'vocabulary_statistics_kernel',
-        (h, i, f, i, 151936 % 4096, 37*4096, -100, False, 512), enable_fp_fusion=True)
+        (h, i, f, i, 151936 % 4096, 37*4096, -100, False, 512))
     add('cross_entropy', 'vocabulary_derivative_kernel',
-        (h, i, f, f, f, h, 4096, 4096, -100, 256), enable_fp_fusion=True)
+        (h, i, f, f, f, h, 4096, 4096, -100, 256))
     for base in (h, f):
         for cast in (False, True):
             add('lora_epilogue', 'lora_scale_add_kernel',
