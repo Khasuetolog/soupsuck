@@ -9,6 +9,11 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a C
 
 FP32_TOL = dict(rtol=1e-5, atol=1e-5)
 FP16_TOL = dict(rtol=2e-3, atol=2e-3)
+# Two fp32 reduction trees over at most 2048 tested rows have about 22
+# addition levels in total; 32 also budgets product/normalization rounding.
+# The standard absolute summation bound scales with sum(abs(terms)), not
+# abs(sum(terms)), which can be arbitrarily small through cancellation.
+DGAMMA_REDUCTION_FACTOR = 32
 
 
 def _norm_reference(x, weight, eps):
@@ -21,6 +26,23 @@ def _reference(residual, delta, weight, eps, out_dtype):
     new = residual + delta
     normed = _norm_reference(new, weight, eps)
     return new, normed.to(out_dtype) if out_dtype is not None else normed
+
+
+def _assert_dgamma(actual, expected, residual, delta, upstream, eps, tolerance):
+    if tolerance is not FP32_TOL:
+        torch.testing.assert_close(actual, expected, **tolerance)
+        return
+    with torch.no_grad():
+        new = residual + delta
+        values = new.float()
+        q = (values * torch.rsqrt(values.square().mean(-1, keepdim=True) + eps)).to(new.dtype)
+        magnitude = (upstream * q).abs().reshape(-1, q.shape[-1]).sum(0)
+        roundoff = DGAMMA_REDUCTION_FACTOR * torch.finfo(torch.float32).eps * magnitude
+        error = (actual.float() - expected.float()).abs()
+        budget = FP32_TOL["rtol"] * expected.float().abs() + roundoff
+        assert (error <= budget).all(), (
+            f"dgamma exceeds magnitude-scaled fp32 reduction budget by "
+            f"{(error - budget).max().item():.8e}")
 
 
 def _check(shape, delta_dtype, out_dtype, train_weight, residual_dtype=torch.float32,
@@ -52,7 +74,7 @@ def _check(shape, delta_dtype, out_dtype, train_weight, residual_dtype=torch.flo
         torch.testing.assert_close(value.grad, ref.grad, **tol)
     if train_weight:
         assert weight.grad.dtype == weight_dtype
-        torch.testing.assert_close(weight.grad, wr.grad, **norm_tol)
+        _assert_dgamma(weight.grad, wr.grad, rr, dr, upstream[1], 1e-6, norm_tol)
     else:
         assert weight.grad is None
 
@@ -97,7 +119,7 @@ def test_one_output_has_no_upstream(used_output):
     if used_output == 0:
         assert torch.count_nonzero(weight.grad).item() == 0
     else:
-        torch.testing.assert_close(weight.grad, wr.grad, **FP32_TOL)
+        _assert_dgamma(weight.grad, wr.grad, rr, dr, upstream, 1e-6, FP32_TOL)
 
 
 def test_batch_lengths_reuse_compiled_variants():
