@@ -28,3 +28,10 @@
 | full ×1 `SOUP_MLP_RECOMPUTE=1` | ce1ff09 | 97.75 s / 14345 MiB / 2.04964 | 93.95 s / 4123 MiB / 2.04968 | 10/10 PASS; speedup **1.040 (<1.05 = 0 баллов скорости)**, memory 3.479, share 10.6% → дефолт остаётся store |
 | **full ×1** | **585de28** | 87.56 s / 14345 MiB / 2.04965 | **71.30 s / 5403 MiB / 2.04971** | **10/10 PASS**; speedup 1.228, memory 2.655, share 14.8%; **pytest solution 247 passed / 0 failed**; Soup 79 passed |
 | **full ×1 (unpad + packed head)** | **42423bf** | 78.32 s / 14345 MiB / 2.04968 | **63.88 s / 4775 MiB / 2.04967** | **10/10 PASS**; speedup 1.226, memory 3.004, share 16.6%; pytest solution 300 passed / 1 failed (test_unpad, разбирается S-032) |
+
+## Пауза 2026-10-30 (по просьбе пользователя)
+- Лучший проверенный результат: **42423bf** full ×1 — 10/10 PASS, speedup 1.226, memory 3.004 (4775 MiB), share 16.6%.
+- HEAD 36257f0 (+S-033 offload fixes) запушен в Kaggle dataset, прогоны не запускались.
+- Незавершено: S-029 (Codex-1, bench_kernels), S-032 (Codex-3, P2 perf + падение test_unpad[(5,5,5,5),9,bnb]).
+- Дальше: замер SOUP_MLP_OFFLOAD=1 / RECOMPUTE поверх unpad; починить test_unpad; финальный full --repeats 2;
+  GitHub-репозиторий команды от пользователя, публичный Kaggle-ноутбук, ссылки в README/SUBMISSION.
