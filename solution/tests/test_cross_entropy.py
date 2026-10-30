@@ -2,6 +2,19 @@
 
 Run: python -m pytest solution/tests/test_cross_entropy.py -q
 Real-shape tests are intentionally enabled by default, including memory checking.
+
+The gradient oracle differentiates CE at the baseline's fp16-rounded logits:
+ideal_dZ = g * (softmax(z) - onehot), ideal_dX = ideal_dZ @ W.half().float().
+Both operations use fp32 with TF32 disabled. This is the analytic gradient
+under the same straight-through cast convention as baseline autograd, without
+rounding dZ to fp16 or accumulating its underflow/overflow in the oracle.
+AMP autograd is diagnostic: with mean-sized g and a large vocabulary its
+fp16 dZ can underflow, even when the final dX is representable. Requiring
+agreement with that rounded dZ would penalize a more accurate implementation.
+We keep the fixed 1% relative norm bound against ideal and also require ours
+to be no worse than 1.1 times AMP's error against ideal plus a fixed 1e-7
+absolute norm gap. The gap is the pre-existing norm check's absolute floor,
+not a tolerance fitted to GPU observations. Oracle tensors are row-chunked.
 """
 
 import math
@@ -18,6 +31,7 @@ METRIC_RTOL = 2e-3
 METRIC_ATOL = 2e-3
 GRAD_RTOL = 1e-2
 GRAD_ATOL = 2e-3
+IDEAL_ABS_GAP = 1e-7
 ARGMAX_AGREEMENT = 0.999
 
 
@@ -49,16 +63,18 @@ def _inputs(n, h, v, weight_dtype, ignored="some", scale=1.0, ignore_index=-100,
 
 
 def _reference(x, w, y, upstream, ignore_index=-100, pure_fp32=False):
-    """Baseline AMP (fp16 logits then fp32 CE); optional pure fp32 comparison."""
+    """Metrics, AMP gradient and analytic fp32 gradient of rounded logits."""
     losses, entropies, indices, normalizers, gradients = [], [], [], [], []
+    ideal_gradients = []
     with torch.autocast(device_type="cuda", enabled=False):
         # Each graph is consumed immediately, not retained for the next block.
         for start in range(0, x.shape[0], 16):
             xr = x[start:start + 16].detach().float().requires_grad_()
+            amp_logits = F.linear(xr.to(torch.float16), w.to(torch.float16)).float()
             if pure_fp32:
                 logits = xr @ w.float().t()
             else:
-                logits = F.linear(xr.to(torch.float16), w.to(torch.float16)).float()
+                logits = amp_logits
             logp = F.log_softmax(logits, dim=-1)
             loss = F.cross_entropy(logits, y[start:start + 16], reduction="none",
                                    ignore_index=ignore_index)
@@ -67,17 +83,31 @@ def _reference(x, w, y, upstream, ignore_index=-100, pure_fp32=False):
             entropies.append(entropy.detach())
             indices.append(logits.detach().argmax(-1))
             normalizers.append(logits.detach().logsumexp(-1))
-            loss.backward(upstream[start:start + 16].float())
+            # No full [N,V] tensor and no autograd/cast edge in the oracle.
+            with torch.no_grad():
+                targets = y[start:start + 16]
+                valid = targets != ignore_index
+                safe_targets = targets.masked_fill(~valid, 0)
+                dz = amp_logits.detach().softmax(-1)
+                rows = torch.arange(targets.numel(), device=x.device)
+                dz[rows, safe_targets] -= valid.to(dz.dtype)
+                dz.mul_(valid[:, None])
+                dz.mul_(upstream[start:start + 16].float()[:, None])
+                ideal_gradients.append(dz @ w.to(torch.float16).float())
+                del dz
+            amp_loss = (F.cross_entropy(amp_logits, y[start:start + 16], reduction="none",
+                                        ignore_index=ignore_index) if pure_fp32 else loss)
+            amp_loss.backward(upstream[start:start + 16].float())
             gradients.append(xr.grad.detach())
-            del xr, logits, logp, loss, entropy
+            del xr, logits, amp_logits, logp, loss, amp_loss, entropy
     return tuple(torch.cat(parts) for parts in
-                 (losses, entropies, indices, normalizers, gradients))
+                 (losses, entropies, indices, normalizers, gradients, ideal_gradients))
 
 
 def _compare(x, w, y, upstream, ignore_index=-100, pure_fp32=False):
     from solution.kernels import fused_linear_cross_entropy
 
-    ref_loss, ref_entropy, ref_argmax, ref_lse, ref_dx = _reference(
+    ref_loss, ref_entropy, ref_argmax, ref_lse, amp_dx, ideal_dx = _reference(
         x, w, y, upstream, ignore_index, pure_fp32)
     loss, entropy, argmax, lse = fused_linear_cross_entropy(x, w, y, ignore_index)
     assert loss.dtype == entropy.dtype == lse.dtype == torch.float32
@@ -92,11 +122,15 @@ def _compare(x, w, y, upstream, ignore_index=-100, pure_fp32=False):
     assert torch.count_nonzero(loss[y == ignore_index]).item() == 0
     loss.backward(upstream)
     assert x.grad.dtype == x.dtype
-    torch.testing.assert_close(x.grad.float(), ref_dx, rtol=GRAD_RTOL, atol=GRAD_ATOL)
-    # Norm check prevents the absolute tolerance from hiding mean-loss underflow.
-    error = torch.linalg.vector_norm(x.grad.float() - ref_dx)
-    norm = torch.linalg.vector_norm(ref_dx)
-    assert error.item() <= GRAD_RTOL * norm.item() + 1e-7
+    ours_error = torch.linalg.vector_norm(x.grad.float() - ideal_dx).item()
+    amp_error = torch.linalg.vector_norm(amp_dx - ideal_dx).item()
+    amp_difference = torch.linalg.vector_norm(x.grad.float() - amp_dx).item()
+    ideal_norm = torch.linalg.vector_norm(ideal_dx).item()
+    print(f"gradient oracle: ||ideal||={ideal_norm:.8e}, "
+          f"||ours-ideal||={ours_error:.8e}, ||AMP-ideal||={amp_error:.8e}, "
+          f"||ours-AMP||={amp_difference:.8e}")
+    assert ours_error <= GRAD_RTOL * ideal_norm
+    assert ours_error <= 1.1 * amp_error + IDEAL_ABS_GAP
     assert torch.count_nonzero(x.grad[y == ignore_index]).item() == 0
     assert w.grad is None
 
