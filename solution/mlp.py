@@ -27,17 +27,21 @@ download pairs prefetch the current/next backward layer. Events protect every
 overwrite; record_stream protects cross-stream allocator lifetime. No host
 synchronize is used. Pools own buffers only; weak ticket links retain no graph.
 Normal backward releases host leases immediately, while retain_graph=True
-keeps CPU data until the final replay or context destruction. The keep-graph
-query is verified in torch 2.11 torch/csrc/autograd/init.cpp; older versions
+keeps CPU data until the final replay or context destruction. Overlapping
+replay of the same ticket is rejected; distinct tickets may run concurrently.
+The keep-graph query is verified in torch 2.11 torch/csrc/autograd/init.cpp;
+older versions
 conservatively retain CPU leases until context destruction.
 
-At the task's maximum N, offload reserves 28*70=1960 MiB pinned host memory
-and three CUDA pairs (210 MiB), instead of 1960 MiB CUDA saved activations.
+At the task's maximum N and without partial recompute, offload reserves
+28*70=1960 MiB pinned host memory and three CUDA pairs (210 MiB), instead of
+1960 MiB CUDA saved activations.
 Each step transfers 3920 MiB over PCIe, plus an upload copy/cast on the GPU.
 Overlap is best-effort: if PCIe falls behind, a GPU event wait bounds memory
 but may slow forward. There is no promise of zero slowdown without T4 timing.
 prepare_mlp_offload(model,max_rows=2048) can reserve all buffers before
-training; lazy first use does the same from config.num_hidden_layers. Only a
+training; lazy first use rounds actual N to a power of two and reserves only
+non-recomputed layers. Reservations keep their high-water mark. Only a
 larger row bound or extra concurrently retained graphs expand capacity; serial
 steps within the reservation do not allocate pinned/staging buffers again.
 
@@ -210,17 +214,36 @@ class _OffloadTicket:
         self.device_slot = None
         self.compute_stream = None
         self.closed = False
+        self.backward_active = False
 
     def begin_backward(self):
-        if self.closed:
-            raise RuntimeError("Offloaded backward graph was freed; use retain_graph=True to replay")
-        self.pool.prefetch(self, required=True)
         with self.pool.lock:
-            self.device_slot.in_use = True
-            self.compute_stream = torch.cuda.current_stream(self.pool.device)
-        previous = self.previous() if self.previous is not None else None
-        if previous is not None and not previous.closed:
-            self.pool.prefetch(previous)  # overlap next layer's H2D with current GEMMs
+            if self.closed:
+                raise RuntimeError("Offloaded backward graph was freed; use retain_graph=True to replay")
+            if self.backward_active:
+                raise RuntimeError("Concurrent replay of one offloaded MLP ticket is unsupported")
+            self.backward_active = True
+            ready = False
+            try:
+                self.pool.prefetch(self, required=True)
+                self.device_slot.in_use = True
+                self.compute_stream = torch.cuda.current_stream(self.pool.device)
+                previous = self.previous() if self.previous is not None else None
+                if previous is not None and not previous.closed:
+                    self.pool.prefetch(previous)
+                ready = True
+            finally:
+                if not ready:
+                    self.release_device()
+                    self.backward_active = False
+
+    def end_backward(self, keep_graph):
+        """Release this invocation even on error; retained CPU data stays replayable."""
+        with self.pool.lock:
+            self.release_device()
+            self.backward_active = False
+            if not keep_graph:
+                self.close()
 
     def tensors(self):
         slot = self.device_slot
@@ -257,7 +280,8 @@ def _pool_for(mlp, x, reserve=None, max_rows=None):
     width = mlp.gate_proj.out_features
     rows = x.numel() // x.shape[-1]
     key = (x.device, width)
-    count = reserve if reserve is not None else getattr(getattr(mlp, "config", None), "num_hidden_layers", 1)
+    total = getattr(getattr(mlp, "config", None), "num_hidden_layers", 1)
+    count = reserve if reserve is not None else max(1, total - _partial_count(mlp))
     with _MODE_LOCK:
         # A resized pool cannot disappear while DMA still touches pinned memory.
         # Query is nonblocking; there is no host synchronization or polling loop.
@@ -268,7 +292,10 @@ def _pool_for(mlp, x, reserve=None, max_rows=None):
         if pool is None or pool.capacity < rows or (max_rows is not None and pool.capacity < max_rows):
             if pool is not None:
                 _RETIRED_POOLS.append(pool)
-            capacity = max(rows, max_rows if max_rows is not None else 2048)
+            # Grow geometrically with packed T, rather than allocating B*S=2048
+            # on the first short batch. Explicit preparation remains an upper bound.
+            capacity = (max(rows, max_rows) if max_rows is not None
+                        else 1 << (max(rows, 1) - 1).bit_length())
             pool = _OffloadPool(x.device, width, capacity, count)
             _OFFLOAD_POOLS[key] = pool
         else:
@@ -279,8 +306,8 @@ def _pool_for(mlp, x, reserve=None, max_rows=None):
 def prepare_mlp_offload(model, max_rows=2048):
     """Optional pre-training reservation; serial steps <=max_rows allocate no pool buffers.
 
-    Lazy first use reserves config.num_hidden_layers slots and capacity 2048,
-    the task's maximum B*S. Explicit preparation supports other bounds and
+    Lazy first use reserves only non-recomputed layers and rounds actual rows
+    up to a power of two. Explicit preparation supports fixed bounds and
     assigns deterministic layer indices even to small test MLPs with distinct configs.
     """
     if max_rows < 1:
@@ -293,19 +320,29 @@ def prepare_mlp_offload(model, max_rows=2048):
         key = (layer.gate_proj.weight.device, layer.gate_proj.out_features)
         groups.setdefault(key, []).append(layer)
     for members in groups.values():
-        layer = members[0]
+        offloaded = [layer for layer in members if os.environ.get("SOUP_MLP_RECOMPUTE") != "1"
+                     and not _partial_recompute(layer)]
+        if not offloaded:
+            continue
+        layer = offloaded[0]
         # A shape-only empty input does not allocate an activation table.
         probe = torch.empty((0, layer.gate_proj.in_features), device=layer.gate_proj.weight.device)
-        _pool_for(layer, probe, reserve=len(members), max_rows=max_rows)
+        _pool_for(layer, probe, reserve=len(offloaded), max_rows=max_rows)
 
 
-def _partial_recompute(mlp):
+def _partial_count(mlp):
     value = os.environ.get("SOUP_MLP_RECOMPUTE_LAYERS", "0")
     count = int(value)
     config = getattr(mlp, "config", None)
     total = getattr(config, "num_hidden_layers", None)
     if count < 0 or (total is not None and count > total):
         raise ValueError("SOUP_MLP_RECOMPUTE_LAYERS must be between 0 and the layer count")
+    return count
+
+
+def _partial_recompute(mlp):
+    count = _partial_count(mlp)
+    config = getattr(mlp, "config", None)
     if not count:
         return False
     with _MODE_LOCK:
@@ -418,33 +455,35 @@ class _FrozenMLP(torch.autograd.Function):
             keep_query = getattr(torch._C._autograd, "_get_current_graph_task_keep_graph", None)
             keep_graph = bool(keep_query()) if keep_query is not None else True
             offloaded.begin_backward()
-        output_edge, act_edge = ctx.down_edges
-        # Standard backward precision, outside forward's autocast region.
-        with torch.autocast(device_type="cuda", enabled=False):
-            dact, = torch.autograd.grad(output_edge, act_edge, grad, retain_graph=True)
-        if ctx.recompute:
-            (x_half,) = ctx.saved_tensors
-            with torch.enable_grad(), torch.autocast(device_type="cuda", enabled=ctx.amp,
-                                                     dtype=ctx.amp_dtype):
-                proxy = _input_proxy(x_half.to(ctx.input_dtype))
-                gate, up = ctx.mlp.gate_proj(proxy), ctx.mlp.up_proj(proxy)
-                edge = torch.autograd.graph.get_gradient_edge
-                projection_edges = ((edge(gate), edge(up)), edge(proxy))
-        elif offloaded is not None:
-            gate, up = offloaded.tensors()
-            projection_edges = ctx.projection_edges
-        else:
-            gate, up = ctx.saved_tensors
-            projection_edges = ctx.projection_edges
-        dgate, dup = swiglu_fused_backward(gate, up, dact, ctx.gate_dtype, ctx.up_dtype)
-        if offloaded is not None:
-            offloaded.release_device()  # event after the LAST read of gate/up
-            if not keep_graph:
-                offloaded.close()
-        outputs, input_edge = projection_edges
-        with torch.autocast(device_type="cuda", enabled=False):
-            dx, = torch.autograd.grad(outputs, input_edge, (dgate, dup), retain_graph=True)
-        return dx.to(ctx.input_dtype), None, None, None
+        try:
+            output_edge, act_edge = ctx.down_edges
+            # Standard backward precision, outside forward's autocast region.
+            with torch.autocast(device_type="cuda", enabled=False):
+                dact, = torch.autograd.grad(output_edge, act_edge, grad, retain_graph=True)
+            if ctx.recompute:
+                (x_half,) = ctx.saved_tensors
+                with torch.enable_grad(), torch.autocast(device_type="cuda", enabled=ctx.amp,
+                                                         dtype=ctx.amp_dtype):
+                    proxy = _input_proxy(x_half.to(ctx.input_dtype))
+                    gate, up = ctx.mlp.gate_proj(proxy), ctx.mlp.up_proj(proxy)
+                    edge = torch.autograd.graph.get_gradient_edge
+                    projection_edges = ((edge(gate), edge(up)), edge(proxy))
+            elif offloaded is not None:
+                gate, up = offloaded.tensors()
+                projection_edges = ctx.projection_edges
+            else:
+                gate, up = ctx.saved_tensors
+                projection_edges = ctx.projection_edges
+            dgate, dup = swiglu_fused_backward(gate, up, dact, ctx.gate_dtype, ctx.up_dtype)
+            if offloaded is not None:
+                offloaded.release_device()  # event after the LAST read of gate/up
+            outputs, input_edge = projection_edges
+            with torch.autocast(device_type="cuda", enabled=False):
+                dx, = torch.autograd.grad(outputs, input_edge, (dgate, dup), retain_graph=True)
+            return dx.to(ctx.input_dtype), None, None, None
+        finally:
+            if offloaded is not None:
+                offloaded.end_backward(keep_graph)
 
 
 def fused_qwen2_mlp(mlp, x, recompute=None, offload=None):

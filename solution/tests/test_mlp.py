@@ -390,3 +390,195 @@ def test_offload_cross_stream_producer_and_consumer(offload_runtime):
     torch.cuda.current_stream().wait_stream(producer)
     assert torch.equal(actual, reference)
     assert torch.equal(other.grad, x.grad)
+
+
+def test_offload_ticket_rejects_overlapping_replay(offload_runtime):
+    """Reject a second reader before it can alter the first reader's slot."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    runtime = offload_runtime
+    layer = FrozenMLP(intermediate=256)
+    x = torch.randn((1, 17, 64), device="cuda", dtype=torch.float16, requires_grad=True)
+    output = runtime.fused_qwen2_mlp(layer, x, False, True)
+    ticket = output.grad_fn.offloaded
+    ticket.begin_backward()
+    first_slot, first_stream = ticket.device_slot, ticket.compute_stream
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(ticket.begin_backward)
+            with pytest.raises(RuntimeError, match="Concurrent replay"):
+                future.result()
+        assert ticket.device_slot is first_slot and ticket.compute_stream == first_stream
+        assert first_slot.in_use and ticket.backward_active
+    finally:
+        ticket.end_backward(keep_graph=True)
+    assert not ticket.backward_active and ticket.device_slot is None
+    # A rejected concurrent reader does not consume/free the retained graph.
+    output.sum().backward(retain_graph=True)
+    gradient = x.grad.clone()
+    x.grad = None
+    output.sum().backward()
+    assert torch.equal(x.grad, gradient)
+    assert ticket.closed and not ticket.host.leased
+
+
+@pytest.mark.parametrize("amp,bnb", [(False, False), (True, False), (True, True)])
+def test_packed_variable_tokens_partial_offload_and_replay(offload_runtime, monkeypatch, amp, bnb):
+    runtime = offload_runtime
+    layers = torch.nn.ModuleList([FrozenMLP(intermediate=256, bnb=bnb,
+                                           dtype=torch.float32 if amp else torch.float16)
+                                  for _ in range(3)])
+    shared = SimpleNamespace(hidden_act="silu", num_hidden_layers=3)
+    for layer in layers:
+        layer.config = shared
+    monkeypatch.setenv("SOUP_MLP_RECOMPUTE_LAYERS", "1")
+    monkeypatch.setenv("SOUP_MLP_OFFLOAD", "1")
+    stable_pointers = None
+    for tokens in (17, 123, 31, 257, 8, 65, 17):
+        x = torch.randn((1, tokens, 64), device="cuda",
+                        dtype=torch.float32 if amp else torch.float16, requires_grad=True)
+        other = x.detach().clone().requires_grad_()
+        with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+            expected, actual = x, other
+            for layer in layers:
+                expected = expected + runtime.fused_qwen2_mlp(layer, expected, False, False)
+                actual = actual + runtime.fused_qwen2_mlp(layer, actual)
+        upstream = torch.randn_like(expected)
+        expected.backward(upstream)
+        actual.backward(upstream, retain_graph=True)
+        torch.testing.assert_close(actual, expected, **TOLERANCE)
+        torch.testing.assert_close(other.grad, x.grad, **TOLERANCE)
+        other.grad = None
+        actual.backward(upstream)
+        torch.testing.assert_close(other.grad, x.grad, **TOLERANCE)
+        pool = next(iter(runtime._OFFLOAD_POOLS.values()))
+        assert pool.capacity >= tokens and pool.capacity <= 512
+        assert len(pool.host) == 2  # three layers minus one recomputed layer
+        assert not any(s.leased for s in pool.host)
+        assert len(pool.staging) == 2
+        if tokens == 17 and stable_pointers is None:
+            assert pool.capacity == 32  # no implicit 2048-row reservation
+        if tokens == 257:
+            stable_pointers = [(s.gate.data_ptr(), s.up.data_ptr()) for s in pool.host]
+        elif stable_pointers is not None:
+            assert stable_pointers == [(s.gate.data_ptr(), s.up.data_ptr()) for s in pool.host]
+        del actual, expected, x, other
+    torch.cuda.synchronize()
+    gc.collect()
+    # A later access collects retired smaller pools after pending DMA completes.
+    runtime._pool_for(layers[-1], torch.empty((1, 1, 64), device="cuda"))
+    assert not runtime._RETIRED_POOLS
+
+
+def test_offload_discard_graph_before_backward_reuses_host(offload_runtime):
+    runtime = offload_runtime
+    layer = FrozenMLP(intermediate=256)
+    runtime.prepare_mlp_offload(layer, max_rows=97)
+    pool = next(iter(runtime._OFFLOAD_POOLS.values()))
+    pointers = [(s.gate.data_ptr(), s.up.data_ptr()) for s in pool.host]
+    for tokens in (17, 97, 31, 65, 17):
+        x = torch.randn((1, tokens, 64), device="cuda", dtype=torch.float16, requires_grad=True)
+        output = runtime.fused_qwen2_mlp(layer, x, False, True)
+        assert any(s.leased for s in pool.host)
+        del output  # intentionally do not wait for D2H before context destruction
+        gc.collect()
+        assert not any(s.leased for s in pool.host)
+    assert pool.host_allocations == 1
+    assert pointers == [(s.gate.data_ptr(), s.up.data_ptr()) for s in pool.host]
+    reference = runtime.fused_qwen2_mlp(layer, x, False, False)
+    other = x.detach().clone().requires_grad_()
+    actual = runtime.fused_qwen2_mlp(layer, other, False, True)
+    upstream = torch.randn_like(reference)
+    reference.backward(upstream)
+    actual.backward(upstream)
+    assert torch.equal(actual, reference) and torch.equal(other.grad, x.grad)
+
+
+def test_offload_out_of_order_graphs_evict_speculative_staging(offload_runtime):
+    runtime = offload_runtime
+    layer = FrozenMLP(intermediate=256)
+    layer.config.num_hidden_layers = 3
+    runtime.prepare_mlp_offload(layer, max_rows=65)
+    inputs, outputs, references = [], [], []
+    for tokens in (17, 31, 65):
+        x = torch.randn((1, tokens, 64), device="cuda", dtype=torch.float16, requires_grad=True)
+        other = x.detach().clone().requires_grad_()
+        references.append(runtime.fused_qwen2_mlp(layer, x, False, False))
+        outputs.append(runtime.fused_qwen2_mlp(layer, other, False, True))
+        inputs.append((x, other))
+    pool = next(iter(runtime._OFFLOAD_POOLS.values()))
+    pool.prefetch(outputs[0].grad_fn.offloaded)
+    pool.prefetch(outputs[1].grad_fn.offloaded)
+    assert all(slot.owner is not None for slot in pool.staging)
+    # Graph 2 requires eviction; graphs 0/1 still retain their CPU leases.
+    for index in (2, 0, 1):
+        upstream = torch.randn_like(outputs[index])
+        references[index].backward(upstream)
+        outputs[index].backward(upstream)
+        x, other = inputs[index]
+        assert torch.equal(outputs[index], references[index])
+        assert torch.equal(other.grad, x.grad)
+    assert not any(s.leased for s in pool.host)
+    assert len(pool.staging) == 2
+
+
+def test_offload_backward_error_releases_reader_and_retains_cpu_data(offload_runtime, monkeypatch):
+    runtime = offload_runtime
+    from solution.kernels import swiglu_fused
+
+    layer = FrozenMLP(intermediate=256)
+    x = torch.randn((1, 17, 64), device="cuda", dtype=torch.float16, requires_grad=True)
+    output = runtime.fused_qwen2_mlp(layer, x, False, True)
+    ticket = output.grad_fn.offloaded
+    native = swiglu_fused.swiglu_fused_backward
+    def fail(*args, **kwargs):
+        raise RuntimeError("injected before activation backward")
+    with monkeypatch.context() as patch:
+        patch.setattr(swiglu_fused, "swiglu_fused_backward", fail)
+        with pytest.raises(RuntimeError, match="injected"):
+            output.sum().backward(retain_graph=True)
+    assert not ticket.backward_active and ticket.device_slot is None
+    assert ticket.host.leased and not ticket.closed
+    assert swiglu_fused.swiglu_fused_backward is native
+    output.sum().backward()
+    assert ticket.closed and not ticket.host.leased
+
+
+def test_offload_growth_preserves_an_older_live_graph(offload_runtime):
+    runtime = offload_runtime
+    layer = FrozenMLP(intermediate=256)
+    graphs = []
+    for tokens in (17, 97):
+        x = torch.randn((1, tokens, 64), device="cuda", dtype=torch.float16, requires_grad=True)
+        other = x.detach().clone().requires_grad_()
+        reference = runtime.fused_qwen2_mlp(layer, x, False, False)
+        actual = runtime.fused_qwen2_mlp(layer, other, False, True)
+        graphs.append((x, other, reference, actual))
+    assert len(runtime._RETIRED_POOLS) == 1
+    old = runtime._RETIRED_POOLS[0]
+    assert old.capacity == 32 and any(s.leased for s in old.host)
+    current = next(iter(runtime._OFFLOAD_POOLS.values()))
+    assert current.capacity == 128
+    for x, other, reference, actual in reversed(graphs):
+        upstream = torch.randn_like(actual)
+        reference.backward(upstream)
+        actual.backward(upstream)
+        assert torch.equal(actual, reference) and torch.equal(other.grad, x.grad)
+    torch.cuda.synchronize()
+    runtime._pool_for(layer, x)
+    assert not runtime._RETIRED_POOLS
+    assert not any(s.leased for s in current.host)
+
+
+def test_prepare_reserves_only_nonrecomputed_layers(offload_runtime, monkeypatch):
+    runtime = offload_runtime
+    layers = torch.nn.ModuleList([FrozenMLP(intermediate=256) for _ in range(4)])
+    monkeypatch.setenv("SOUP_MLP_RECOMPUTE_LAYERS", "3")
+    runtime.prepare_mlp_offload(layers, max_rows=33)
+    pool = next(iter(runtime._OFFLOAD_POOLS.values()))
+    assert pool.capacity == 33 and len(pool.host) == 1
+    assert [runtime._partial_recompute(layer) for layer in layers] == [True, True, True, False]
+    runtime._OFFLOAD_POOLS.clear()
+    monkeypatch.setenv("SOUP_MLP_RECOMPUTE", "1")
+    runtime.prepare_mlp_offload(layers, max_rows=33)
+    assert not runtime._OFFLOAD_POOLS
