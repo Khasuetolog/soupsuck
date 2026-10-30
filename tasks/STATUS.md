@@ -36,3 +36,4 @@
 - Дальше: замер SOUP_MLP_OFFLOAD=1 / RECOMPUTE поверх unpad; починить test_unpad; финальный full --repeats 2;
   GitHub-репозиторий команды от пользователя, публичный Kaggle-ноутбук, ссылки в README/SUBMISSION.
 | full ×1 | e0c50a2 | 87.82 s / 14345 MiB / 2.04959 | 65.52 s / 4795 MiB / 2.04964 | speedup 1.340, memory 2.992; pytest solution 315/1 failed (test_unpad, S-034) |
+| **full ×1 SOUP_MLP_OFFLOAD=1** | 39b5050 | 84.33 s / 14345 MiB / 2.04965 | **68.14 s / 3765 MiB / 2.04968** | **10/10 PASS**; speedup 1.238, **memory 3.810** → offload становится дефолтом (S-035) |
