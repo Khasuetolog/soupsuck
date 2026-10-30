@@ -35,3 +35,4 @@
 - Незавершено: S-029 (Codex-1, bench_kernels), S-032 (Codex-3, P2 perf + падение test_unpad[(5,5,5,5),9,bnb]).
 - Дальше: замер SOUP_MLP_OFFLOAD=1 / RECOMPUTE поверх unpad; починить test_unpad; финальный full --repeats 2;
   GitHub-репозиторий команды от пользователя, публичный Kaggle-ноутбук, ссылки в README/SUBMISSION.
+| full ×1 | e0c50a2 | 87.82 s / 14345 MiB / 2.04959 | 65.52 s / 4795 MiB / 2.04964 | speedup 1.340, memory 2.992; pytest solution 315/1 failed (test_unpad, S-034) |
