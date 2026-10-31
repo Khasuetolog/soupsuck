@@ -42,6 +42,7 @@
  "promotion_rule": "Zero speed regression: a candidate replaces BEST_VALIDATED only if peak memory is lower AND paired same-session A/B wall time is not slower (median diff <= 0, CI upper bound not clearly > 0), then full2 + check_rules 10/10. Memory-only wins stay in BEST_MEMORY_EXPERIMENT. Target peak 2.3-2.8 GiB, runtime <= 71.0 s (preferred < 68 s).",
  "rejected": {
   "EXP-008 SOUP_EXP_LORA_PAIR": "aaca49c A/B: wall +0.245 s CI [-0.615,0.55], peak 0: no gain",
-  "EXP-006 SOUP_EXP_NF4_FAST": "457cf41 A/B: wall -0.055 s CI [-0.53,0.25]: no gain"
+  "EXP-006 SOUP_EXP_NF4_FAST": "457cf41 A/B: wall -0.055 s CI [-0.53,0.25]: no gain",
+  "EXP-011 launch-config tuning": "bench 96a890c: best configs only 0-6.5% per small kernel (NF4 decode +1.9%); est. total <0.2 s/run of ~4.9 s own-kernel time, below A/B noise; production configs kept"
  }
 }
