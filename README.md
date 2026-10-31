@@ -22,10 +22,10 @@ Correctness on the same T4 stack: **518 passed, 1 skipped** solution tests
 regression tests with `apply()` (check 10).
 
 **Why we report ratios, not only seconds.** Base timing drifts between Kaggle
-sessions (we observed base 77.7–91.4 s for identical code). The score uses the
+sessions (77.7–91.4 s in selected recent sessions with identical base code). The score uses the
 ratio of base to solution inside one session, so every number above comes from
-one session, and every optimization decision below comes from *paired*
-same-session A/B rounds.
+one session. Whole-run optimization deltas below come from *paired* same-session
+A/B rounds; microbenchmarks, estimates and historical comparisons are labelled separately.
 
 - Public Kaggle notebook, saved version: `<KAGGLE_LINK>`
 - Final submission commit: `<FINAL_COMMIT>`
@@ -33,18 +33,25 @@ same-session A/B rounds.
 
 ## Where the time goes
 
-Instrumented single solution run on T4 (`tools/kaggle/start_probe.py`,
-commit `f81a736`, observer overhead included; 66.4 s total):
+Partial instrumented observation of one solution run on T4
+(`tools/kaggle/start_probe.py`, commit `f81a736`, observer overhead included;
+66.4 s total). The probe records `ok=false` because `import.bitsandbytes` is
+missing from its phase coverage; the intervals below are observations from that
+incomplete probe, not a complete attribution of startup:
 
 | Phase | Seconds | Notes |
 | --- | ---: | --- |
-| Interpreter + imports before `apply()` | 5.1 | torch, Soup CLI |
-| `apply()` → first training step | 18.7 | transformers/TRL/PEFT imports (~5 s self time in `trl.import_utils` and `transformers.utils.import_utils` alone), weight load, 4-bit quantization 2.2 s, trainer init; our Triton compilation runs in a parallel child process here |
+| Interpreter + imports before `apply()` | 5.1 | torch and early imports; excludes the initial interpreter/probe bootstrap |
+| `apply()` → first training step | 18.7 | further imports including TRL/PEFT, weight load, trainer init; the 4-bit quantization first-to-last event span is 2.2 s, including gaps between events; our Triton compilation runs in a parallel child process here |
 | 64 training steps | 38.3 | first step 3.4 s, median 0.49 s |
 | Adapter save + process exit | 4.1 | |
 
-About 24 s of every run is fixed Python/model setup outside the training loop
-that `solution/` cannot reach without touching the harness. Inside the loop,
+The first step began 23.97 s after process launch in this instrumented run.
+In the final two-repeat `full2` run on `96a890c`, wall time minus the training
+loop averaged 25.8 s (25.77 / 25.87 s), including startup and shutdown.
+These observed intervals can vary between runs. Displayed phase times are
+rounded; interpreter/probe bootstrap and `apply()` add less than 0.1 s.
+Inside the loop,
 the per-step layer profile (`tools/kaggle/layer_profile.py`) attributes NF4
 weight decoding 83 ms, bitsandbytes/cuBLAS GEMMs ~136 ms, MLP offload waits
 57 ms, SDPA 48 ms, LoRA 30 ms and norms/RoPE 27 ms per step.
@@ -247,7 +254,8 @@ activation memory. Local GradientEdges preserve projection backward without
 retaining the entire activation buffer as a tensor leaf. Frozen, supported
 projection types qualify; trainable projections, hooks and wrappers fall back.
 Only first-order gradients are implemented. Recompute is off by default; the
-default keeps fp16 gate/up and offloads them to host memory (next section).
+default keeps fp16 gate/up and offloads them to host memory as described under
+[asynchronous MLP activation offload](#asynchronous-mlp-activation-offload).
 
 ### NF4 decoder
 
@@ -346,9 +354,12 @@ are used by this implementation.
    URL and `COMMIT` to `<FINAL_COMMIT>`. The harness uses one GPU. For a private
    repository, configure the read-only `GITHUB_TOKEN` Kaggle secret as the
    template describes.
-3. Run all cells. For the final comparison, use
-   `python harness/run_task.py --repeats 2` in the training cell, then run the
-   unchanged checks and score cells. This runs base, solution, solution, base.
+3. Run all cells with the template unchanged. Its training cell runs
+   `python harness/run_task.py`: one base and one solution run, followed by the
+   checks and score cells. The saved public notebook uses this one-repeat
+   procedure. The two-repeat evidence reported above comes from a separate
+   development `full2` run (base, solution, solution, base), reproducible with
+   the local commands or development runner below.
 4. Save the completed notebook version, publish it, and replace `<KAGGLE_LINK>`
    here and in SUBMISSION with the same saved-version link. Preserve result,
    checks, metrics and logs with that notebook.
@@ -371,7 +382,9 @@ python harness/score.py runs/result.json
 
 The measured runtime was Python 3.13.15, torch 2.11.0+cu128, Triton 3.6.0 and
 Tesla T4 driver 580.178.04, with the package versions above; source:
-`E/runs/result.json:versions`. The head's backward relies on CUDA `torch.mm` support for
+`versions` in `runs/result.json` within the `full2` evidence directory listed
+under [Results and kernel-time accounting](#results-and-kernel-time-accounting).
+The head's backward relies on CUDA `torch.mm` support for
 `out_dtype=torch.float32`; its forward logits use fp16 GEMM output. A different runtime must be validated.
 The harness sets the allocator and restricts training to one GPU; do not
 substitute a different allocator or prepopulate compiler caches.
@@ -420,34 +433,39 @@ in Git). Shares are `100 * own_kernel_ms / (1000 * timed_loop_s)` for steps
 | `rmsnorm_forward_kernel` | 81.1 | 0.23 % | 0.23 % |
 | `lora_scale_gradient_kernel` | 75.7 | 0.21 % | 0.21 % |
 | `vocabulary_outputs_kernel` | 0.5 | 0.00 % | 0.00 % |
-| **Total counted own kernels** | **4768.1** | **13.5 %** | **13.3 %** |
+| **Total counted own kernels** | **4768.0** | **13.5 %** | **13.3 %** |
 
+The total uses unrounded timings; individual rows are rounded independently.
 No `example_*`, cuBLAS or library kernel time is counted.
 
-### Optimization history (paired same-session A/B)
+### Optimization history
 
-Each candidate ran behind an opt-in flag; A = current default, alternating
-order over rounds (`tools/kaggle/registry.py`, median of paired differences,
-95 % bootstrap CI). A change became default only if it was not slower, did not
-raise peak memory and kept eval loss, then passed `full2` + `check_rules`.
+For whole-run A/B experiments, A = the default at the time and candidates use
+opt-in flags, alternating order over rounds (`tools/kaggle/registry.py`, median
+of paired differences, 95 % bootstrap CI). Current promotion requires paired
+wall time not slower and peak memory not higher, preserved eval loss, then
+`full2` + `check_rules`. Historical adoption decisions and other evidence types
+are recorded explicitly below.
 
 | Change | Δ wall, s (95 % CI) | Δ peak, MiB | Decision |
 | --- | --- | ---: | --- |
-| Out-of-process Triton precompile + launch trim (EXP-001/004) | −1.80 [−5.96, −1.60] | 0 | default |
+| Out-of-process Triton precompile + launch trim (EXP-001/004) | −1.80 [−5.96, −1.60]; 3 pairs, `d5dc84b` | +4 (3,765 → 3,769) | historical default adoption |
 | Prebuilt native CPU launchers in the compile child (EXP-010) | **−3.33 [−3.66, −2.86]**; first step 6.53 → 2.93 s | 0 | **default (`96a890c`)** |
 | Parent launcher warm-up (EXP-013) | −0.41 [−1.31, +1.16]; first step −0.68 | 0 | not adopted (CI crosses 0) |
 | High-priority offload copy streams (EXP-015) | −0.25 [−0.50, +0.30] | 0 | not adopted (noise) |
 | Faster packed NF4 decode kernel (EXP-006) | −0.06 [−0.53, +0.25] | 0 | not adopted (noise) |
 | Single autograd boundary for the LoRA pair (EXP-008) | +0.25 [−0.62, +0.55] | 0 | rejected |
 | Offload gate + input, recompute up (EXP-009) | +2.06 [+0.97, +2.38] | −82 | rejected: slower |
-| Keep last k MLPs on GPU (EXP-007) | not measured | +70·k | rejected: more memory |
-| Own NF4×fp16 Triton GEMM (EXP-002) | 4–66× slower than cuBLAS per GEMM | — | rejected |
-| Launch-config sweep, bit-identical outputs (EXP-011) | ≤ 6.5 % per kernel, < 0.2 s/run | 0 | not adopted |
+| Keep last k MLPs on GPU (EXP-007) | not measured | estimated +70·k | not adopted: estimated memory increase |
+| Own NF4×fp16 Triton GEMM (EXP-002) | microbenchmark: 4–66× slower than decode + cuBLAS per GEMM | — | rejected |
+| Launch-config sweep, bit-identical outputs (EXP-011) | microbenchmark: ≤ 6.5 % per kernel; estimated < 0.2 s/run | not measured | not adopted |
 
 Memory is a separate decision: MLP gate/up offload to pinned host memory and
 the fp16 norm/head paths are what bring the peak from 14,345 to 3,769 MiB.
-Full MLP recomputation reached 4,123 MiB but cost +20 s, so the default is
-asynchronous offload.
+Historically, full MLP recomputation reached 4,123 MiB at `ce1ff09`; its
+93.95 s wall time versus 73.54 s for store mode was about +20 s across separate
+Kaggle sessions. This is a historical cross-session observation, not a paired
+estimate of its cost. The current default is asynchronous offload.
 
 ## Limitations and review status
 
@@ -491,7 +509,7 @@ these reported artifacts do not modify its measurement code.
 | `harness/` | Timing, sampled memory, evaluator, checks and scoring |
 | `tests/` | Soup regression tests |
 | Trainer settings and Soup outputs | Same adapter parameters/shapes, metrics, token counts and Rewind rows/losses within allowed tolerances |
-| Measurement environment | One T4 GPU, harness allocator, no background GPU work, warm compiler cache or measurement-dependent behavior |
+| Measurement environment | One T4 GPU, harness allocator; no background GPU work; no warm compiler cache; no measurement-dependent behavior |
 
 The task uses 256 public training rows, batch size 4 and maximum length 512,
 one epoch with LoRA r=16, alpha=32 and the unchanged Soup dropout/target defaults;

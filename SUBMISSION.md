@@ -14,7 +14,7 @@
 
 ## Final result
 
-Two base and two solution repetitions in one Kaggle T4 session, solution commit
+Two base and two solution repetitions in one Kaggle T4 development `full2` session, solution commit
 `96a890c`, `harness/check_rules.py`: **ALL CHECKS PASSED (10/10)**.
 
 | Measurement | Base | Ours | Ratio |
@@ -29,14 +29,17 @@ Solution suite on T4: 518 passed, 1 skipped, 0 failed. Soup regression tests
 with `apply()`: 79/79. Evidence (local, not in Git):
 `runs_kaggle/20261031T133425573730Z_full2_96a890c_promote010/out/`.
 
-Base wall time varies between Kaggle sessions (77.7–91.4 s observed for the
-same code), so compare the in-session ratio. Paired same-session A/B
-measurements for every optimization, and the time breakdown of a run, are in
+Base wall time varies between Kaggle sessions (77.7–91.4 s in selected recent
+sessions with identical base code), so compare the in-session ratio. Paired
+same-session A/B results for whole-run experiments, separately labelled
+microbenchmarks, estimates and historical comparisons, and a partial
+instrumented time breakdown are in
 [README.md](README.md).
 
 ## Reproduce
 
-After installing pinned dependencies and preparing data, from the repository root:
+To reproduce the two-repeat `full2` evidence after installing pinned dependencies
+and preparing data, from the repository root:
 
 ```bash
 git checkout <FINAL_COMMIT>
@@ -58,5 +61,7 @@ do not replace attention or the 4-bit GEMM. Lossless embedding storage applies
 only when every element round-trips exactly through fp16. Early fp16 norm output
 preserves dropout masks/RNG but can change values by fp16 rounding; public checks
 5–7 pass on two repeats, which does not prove equality on hidden rows or seeds.
-About 24 s of each run is Python/model setup outside the training loop that the
-solution cannot change without editing the harness. See [tasks/REVIEW.md](tasks/REVIEW.md).
+The partial instrumented probe observed 23.97 s before the first training step
+(`ok=false`, missing `import.bitsandbytes` coverage); the final `full2` wall time
+minus training loop averaged 25.8 s, including startup and shutdown. See the
+measurement details in [README.md](README.md) and [tasks/REVIEW.md](tasks/REVIEW.md).
