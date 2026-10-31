@@ -150,6 +150,51 @@ def env_hash(environment):
     return hashlib.sha256(json.dumps(environment, sort_keys=True).encode()).hexdigest()[:6] if environment else ""
 
 
+def cpu_token_notebook(notebook):
+    """Reuse archive verification/logging, with a CPU-only execution cell."""
+    source = ''.join(notebook['cells'][2]['source'])
+    boundary = '\nsave_status()\ntry:'
+    if source.count(boundary) != 1:
+        raise ValueError('Notebook bootstrap changed; review tokstats CPU extraction')
+    bootstrap = source.split(boundary)[0]
+    execution = r'''
+os.environ['CUDA_VISIBLE_DEVICES'] = ''
+os.environ['ACCELERATE_USE_CPU'] = 'true'
+save_status()
+try:
+    assert MODE == 'tokstats' and not EXPERIMENT_ENV, 'tokstats uses the unchanged official task'
+    rc = command('pip_cpu', ['python', '-m', 'pip', 'install', '-q',
+                            'torch==2.11.0', '--index-url', 'https://download.pytorch.org/whl/cpu'])
+    assert rc == 0, 'CPU torch installation failed; see pip_cpu.log'
+    rc = command('pip', ['python', '-m', 'pip', 'install', '-q',
+                         'soup-cli[train]==0.77.0', 'transformers==5.16.1',
+                         'peft==0.20.0', 'trl==0.29.1', 'bitsandbytes==0.50.2',
+                         'accelerate==1.14.0', 'datasets==4.8.5'])
+    assert rc == 0, 'Pinned dependency installation failed; see pip.log'
+    copy_source()
+    rc = command('prepare_data', ['python', 'task/prepare_data.py'], cwd=REPO)
+    assert rc == 0, 'Official data preparation failed; see prepare_data.log'
+    command('token_stats', ['python', 'tools/kaggle/token_stats.py',
+                            '--out', str(OUT), '--commit', EXPECTED_SHA], cwd=REPO)
+    status['ok'] = all(item['exit_code'] == 0 for item in status['commands'])
+except Exception as exc:
+    status['fatal_error'] = type(exc).__name__ + ': ' + str(exc)
+    (OUT / 'notebook-error.log').write_text(traceback.format_exc())
+    print(status['fatal_error'])
+finally:
+    save_status()
+    if REPO.exists():
+        shutil.rmtree(REPO)
+    print('Saved CPU token statistics and logs:', OUT)
+    print(json.dumps(status, indent=2))
+'''
+    notebook['cells'][0]['source'] = ['# CPU token statistics\n',
+        'Official Soup/TRL dataset and dataloader; no model load or GPU.\n']
+    notebook['cells'][2]['source'] = (bootstrap + '\n' + execution).splitlines(keepends=True)
+    notebook.get('metadata', {}).pop('accelerator', None)
+    return notebook
+
+
 def build_kernel(mode, user, sha, environment=None, tag="", variants=None, rounds=4):
     environment = dict(environment or {})
     directory = Path(tempfile.mkdtemp(prefix="soup-kaggle-kernel-"))
@@ -171,6 +216,10 @@ def build_kernel(mode, user, sha, environment=None, tag="", variants=None, round
         "competition_sources": [], "kernel_sources": [], "model_sources": [],
     }
     notebook = json.loads((Path(__file__).parent / "iterate.ipynb").read_text())
+    if mode == 'tokstats':
+        metadata['enable_gpu'] = False
+        metadata.pop('machine_shape')
+        notebook = cpu_token_notebook(notebook)
     notebook["cells"][1]["source"] = [
         f"MODE = {mode!r}\n", f"EXPECTED_SHA = {sha!r}\n",
         f"DATASET = {metadata['dataset_sources'][0]!r}\n",
@@ -196,6 +245,13 @@ def terminal_status(output):
 
 
 def summarize(directory):
+    for path in sorted(directory.rglob('token_stats.json')):
+        if __package__:
+            from .token_stats import print_table
+        else:
+            from token_stats import print_table
+        print('CPU token statistics:', path.relative_to(directory))
+        print_table(json.loads(path.read_text()))
     for path in sorted(directory.rglob("result.json")):
         value = json.loads(path.read_text())
         summary = value.get("summary", {})
@@ -274,6 +330,8 @@ def summarize(directory):
 
 def run(args):
     environment = dict(args.env)
+    if args.mode == 'tokstats' and environment:
+        raise ValueError('tokstats uses the unchanged task and accepts no experiment --env')
     if args.mode == "ab":
         if environment:
             raise ValueError("ab uses --variants only; --env would change the unchanged control A")
@@ -305,8 +363,10 @@ def run(args):
     write_json(output / "launch.json", {"commit": sha, "kernel": metadata["id"], "mode": args.mode,
                                         "env": environment, "tag": args.tag, "variants": args.variants,
                                         "rounds": (args.rounds or 4) if args.mode == "ab" else None})
-    kaggle("kernels", "push", "-p", directory, "--accelerator", "NvidiaTeslaT4",
-           "--timeout", str(TIMEOUT_SECONDS))
+    push_args = ['kernels', 'push', '-p', directory]
+    if args.mode != 'tokstats':
+        push_args += ['--accelerator', 'NvidiaTeslaT4']
+    kaggle(*push_args, '--timeout', str(TIMEOUT_SECONDS))
     deadline = time.monotonic() + TIMEOUT_SECONDS
     status = "unknown"
     try:
@@ -353,8 +413,8 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     push = commands.add_parser("push-code", help="Publish committed HEAD as a private Kaggle dataset")
     push.set_defaults(handler=push_code)
-    launch = commands.add_parser("run", help="Run a private T4 notebook and download its outputs")
-    launch.add_argument("--mode", choices=("unit", "solution", "full", "full2", "probe", "bench", "ab", "layerprof"), required=True)
+    launch = commands.add_parser("run", help="Run a private notebook and download its outputs")
+    launch.add_argument("--mode", choices=("unit", "solution", "full", "full2", "probe", "bench", "ab", "layerprof", "tokstats"), required=True)
     launch.add_argument("--dry-run", action="store_true", help="Build notebook/metadata without invoking Kaggle")
     launch.add_argument("--env", action="append", type=env_pair, default=[], metavar="SOUP_KEY=VALUE",
                         help="Repeatable; SOUP_EXP_* accepts 1 (PRECOMPILE also process); SOUP_APPLY_SOLUTION is reserved")
