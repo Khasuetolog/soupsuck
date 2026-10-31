@@ -40,15 +40,15 @@ full-V probe, sanitizer и новый полный training/harness run в эт�
   импортов, 0 ошибок разбора. Два `example_swiglu_*` остаются в kit-файле
   `solution/swiglu.py`; own-путь их не регистрирует.
 - AST-константы NF4 против сохранённого исходника bnb 0.50.2
-  `/private/tmp/s021-bnb-kernels.cu`: 16/16 fp32 bit patterns совпали.
+  `<tmp>/s021-bnb-kernels.cu`: 16/16 fp32 bit patterns совпали.
   Разложение всех 256 байтов на high/low nibble также проверено.
 
 В системном Python нет pytest. Для CPU-проверок создано отдельное окружение
-`/private/tmp/s037-audit-env` с pytest; torch не устанавливался. Репозиторий
+`<tmp>/s037-audit-env` с pytest; torch не устанавливался. Репозиторий
 и зависимости обучения этим не менялись. Команда локального pytest:
 
 ```sh
-/private/tmp/s037-audit-env/bin/python -m pytest solution/tests/test_cross_entropy.py solution/tests/test_rmsnorm.py solution/tests/test_add_rmsnorm.py solution/tests/test_lora.py solution/tests/test_nf4.py solution/tests/test_rope.py solution/tests/test_embedding.py solution/tests/test_integration.py -q -rs
+<tmp>/s037-audit-env/bin/python -m pytest solution/tests/test_cross_entropy.py solution/tests/test_rmsnorm.py solution/tests/test_add_rmsnorm.py solution/tests/test_lora.py solution/tests/test_nf4.py solution/tests/test_rope.py solution/tests/test_embedding.py solution/tests/test_integration.py -q -rs
 ```
 
 ## Проверка всех 15 @triton.jit
@@ -98,7 +98,7 @@ full-V probe, sanitizer и новый полный training/harness run в эт�
 - Ни один из 15 JIT не имеет N/S/leading shape в constexpr. Остаются H,
   геометрия tile, EPS, IGNORE и структурные флаги. Смена dtype/флагов и
   alignment/==1 runtime specialization может создать дополнительные variants.
-  Это согласуется с сохранённым `/private/tmp/featherduster-triton-3.6.0-jit.py`;
+  Это согласуется с сохранённым `<tmp>/featherduster-triton-3.6.0-jit.py`;
   реальные cache-count assertions требуется повторить на T4.
 
 ## CE и интеграция

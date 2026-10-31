@@ -5,11 +5,11 @@
 ## Область доказательств
 
 Все пути `site/...:строка` ниже относительны к **реально прочитанному** каталогу:
-`/private/tmp/claude-501/-Users-arystan-orca-workspaces-decentrathon-6-0-featherduster/c29b337b-6a21-4aad-b075-87130cee4abf/scratchpad/src/`.
+`<scratch>`.
 В `site` распакованы soup_cli 0.77.0, transformers 5.16.1, peft 0.20.0, trl 0.29.1, accelerate 1.14.0. Это исходники, не работающая локальная GPU-инсталляция.
 Пути без `site/` — файлы checkout. Для отсутствующего bitsandbytes использован официальный исходник тега 0.50.2 по ссылкам ниже; он не установлен и не добавлен в репозиторий. Номера строк GitHub — обычные, начиная с 1.
 
-Workspace подтверждён командой `pwd`: `/Users/arystan/orca/workspaces/decentrathon 6.0/featherduster`.
+Workspace подтверждён командой `pwd`: `<repo>`.
 Аккаунт и effective launch **UNVERIFIED**: `orca terminal show` и `orca orchestration check` возвращают `runtime_access_denied`, `The Codex sandbox blocked this command from connecting to Orca (EPERM)`. Политика сессии запрещает повышение прав; отправка escalation/heartbeat тоже блокируется. По названию терминала аккаунт не выводился.
 
 ## 1. Путь soup train и фактический trainer

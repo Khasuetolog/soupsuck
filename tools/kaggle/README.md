@@ -14,7 +14,7 @@ Runner использует Python stdlib и Kaggle CLI 2.2.5. Команды и
 Из корня checkout:
 
 ```bash
-export KAGGLE_BIN=/private/tmp/claude-501/-Users-arystan-orca-workspaces-decentrathon-6-0-featherduster/c29b337b-6a21-4aad-b075-87130cee4abf/scratchpad/kvenv/bin/kaggle
+export KAGGLE_BIN=<scratch>
 # Необязательно, если username уже есть в конфигурации CLI:
 export KAGGLE_USERNAME=your_kaggle_username
 

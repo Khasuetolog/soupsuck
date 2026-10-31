@@ -45,11 +45,11 @@ full harness на b1dcb59 отдельно не запускались; их с�
 Python 3.14/macOS, torch/CUDA недоступны. Использован существующий pytest venv:
 
 ```bash
-/private/tmp/s004-integration-venv/bin/python -m pytest \
+<tmp>/s004-integration-venv/bin/python -m pytest \
   solution/tests/test_unpad.py solution/tests/test_mlp.py -q -rs
 # 17 passed, 28 skipped in 0.38s; exit 0
 
-/private/tmp/s004-integration-venv/bin/python -m pytest \
+<tmp>/s004-integration-venv/bin/python -m pytest \
   solution/tests/test_integration.py solution/tests/test_embedding.py \
   solution/tests/test_lora.py solution/tests/test_rope.py \
   solution/tests/test_nf4.py -q -rs
