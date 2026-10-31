@@ -18,6 +18,15 @@ import traceback
 from unittest.mock import patch
 
 
+def _set_trim_mode(trim):
+    """Resolve test's tri-state request using the production default-on rule."""
+    if trim is None:
+        os.environ.pop("SOUP_EXP_LAUNCH_TRIM", None)
+    else:
+        os.environ["SOUP_EXP_LAUNCH_TRIM"] = "1" if trim else "0"
+    return os.environ.get("SOUP_EXP_LAUNCH_TRIM") != "0"
+
+
 def run(report):
     import torch
     import bitsandbytes as bnb
@@ -48,10 +57,7 @@ def run(report):
             raise AssertionError(f"{name}: not bitwise equal; max_abs={float(error.max())}")
 
     def snapshot(wrapped, raw, ids, labels, mask, initial, trim):
-        if trim is None:  # exercise the actual production default
-            os.environ.pop("SOUP_EXP_LAUNCH_TRIM", None)
-        else:
-            os.environ["SOUP_EXP_LAUNCH_TRIM"] = "1" if trim else "0"
+        trim_active = _set_trim_mode(trim)
         torch.cuda.set_rng_state(initial)
         wrapped.zero_grad(set_to_none=True)
         sdpa_calls, bases, epilogues = [], [], []
@@ -97,7 +103,7 @@ def run(report):
             assert tensor._version == version, "base result mutated after adapter or backward"
         base_pointers = {tensor.data_ptr() for tensor, _ in bases}
         aliases = sum(t.data_ptr() in base_pointers for t, _ in epilogues)
-        assert aliases == (len(epilogues) if trim else 0), (trim, aliases, len(epilogues))
+        assert aliases == (len(epilogues) if trim_active else 0), (trim, trim_active, aliases, len(epilogues))
         values = dict(loss=output.loss.detach().clone(), token_loss=step.token_loss.clone(),
                       entropy=step.token_entropy.clone(), correct=step.correct.clone(),
                       labelled=step.labelled.clone(), rng=torch.cuda.get_rng_state(),
@@ -115,22 +121,29 @@ def run(report):
                 initial = torch.cuda.get_rng_state()
                 reference, calls, clones = snapshot(wrapped, raw, ids, labels, mask, initial, False)
                 actual, changed_calls, aliases = snapshot(wrapped, raw, ids, labels, mask, initial, None)
+                explicit, explicit_calls, _ = snapshot(wrapped, raw, ids, labels, mask, initial, True)
                 for key in ("loss", "token_loss", "entropy", "correct", "labelled", "rng", "num_tokens"):
                     bits(actual[key], reference[key], key)
+                    bits(explicit[key], actual[key], f"explicit/default {key}")
                 assert actual["grads"].keys() == reference["grads"].keys()
+                assert explicit["grads"].keys() == actual["grads"].keys()
                 for name in reference["grads"]:
                     bits(actual["grads"][name], reference["grads"][name], name)
-                assert len(calls) == len(changed_calls) == len(lengths) * 2
-                for original, changed in zip(calls, changed_calls):
+                    bits(explicit["grads"][name], actual["grads"][name], f"explicit/default {name}")
+                assert len(calls) == len(changed_calls) == len(explicit_calls) == len(lengths) * 2
+                for original, changed, enabled in zip(calls, changed_calls, explicit_calls):
                     assert original[1:] == changed[1:], "SDPA layouts/arguments changed"
+                    assert enabled[1:] == changed[1:], "explicit/default SDPA layouts/arguments changed"
                     for index, (left, right) in enumerate(zip(original[0], changed[0])):
                         bits(left, right, f"SDPA input {index}")
+                    for index, (left, right) in enumerate(zip(enabled[0], changed[0])):
+                        bits(left, right, f"explicit/default SDPA input {index}")
                 record = dict(offload=offload, seed=seed, lengths=lengths, bitwise=True,
                               sdpa_calls=len(calls), clones_removed=aliases,
                               lora_gradient_tensors=len(actual["grads"]))
                 report["cases"].append(record)
                 print(json.dumps(record), flush=True)
-                del wrapped, raw, reference, actual, calls, changed_calls
+                del wrapped, raw, reference, actual, explicit, calls, changed_calls, explicit_calls
                 torch.cuda.synchronize()
                 gc.collect()
     report["ok"] = True
@@ -182,6 +195,20 @@ def test_launch_trim_bnb_bitwise_outputs_gradients_rng_and_aliases(tmp_path):
         assert case["clones_removed"] == 4  # two layers, q/v adapters
         assert case["sdpa_calls"] == 8  # four rows per layer
         assert case["lora_gradient_tensors"] == 8  # A/B for four adapters
+
+
+def test_snapshot_trim_request_resolves_default_on_and_explicit_opt_out(monkeypatch):
+    # Reproduce the failed T4 request (None, four aliases) without CUDA.
+    # Also ensure no previous snapshot's environment leaks into the next one.
+    monkeypatch.setenv("SOUP_EXP_LAUNCH_TRIM", "0")
+    assert _set_trim_mode(None) is True
+    assert "SOUP_EXP_LAUNCH_TRIM" not in os.environ
+    assert _set_trim_mode(False) is False
+    assert os.environ["SOUP_EXP_LAUNCH_TRIM"] == "0"
+    assert _set_trim_mode(True) is True
+    assert os.environ["SOUP_EXP_LAUNCH_TRIM"] == "1"
+    assert _set_trim_mode(None) is True
+    assert "SOUP_EXP_LAUNCH_TRIM" not in os.environ
 
 
 def test_launch_trim_default_and_literal_zero_opt_out(monkeypatch):
