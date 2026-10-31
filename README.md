@@ -366,7 +366,7 @@ are used by this implementation.
    procedure. The two-repeat evidence reported above comes from a separate
    development `full2` run (base, solution, solution, base), reproducible with
    the local commands or development runner below.
-4. Save the completed notebook version, publish it, and replace https://www.kaggle.com/code/khasansueta/notebookf3ae4d2bef
+4. Save the completed notebook version, publish it, and put its link
    here and in SUBMISSION with the same saved-version link. Preserve result,
    checks, metrics and logs with that notebook.
 
