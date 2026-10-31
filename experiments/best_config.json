@@ -43,6 +43,8 @@
  "rejected": {
   "EXP-008 SOUP_EXP_LORA_PAIR": "aaca49c A/B: wall +0.245 s CI [-0.615,0.55], peak 0: no gain",
   "EXP-006 SOUP_EXP_NF4_FAST": "457cf41 A/B: wall -0.055 s CI [-0.53,0.25]: no gain",
-  "EXP-011 launch-config tuning": "bench 96a890c: best configs only 0-6.5% per small kernel (NF4 decode +1.9%); est. total <0.2 s/run of ~4.9 s own-kernel time, below A/B noise; production configs kept"
+  "EXP-011 launch-config tuning": "bench 96a890c: best configs only 0-6.5% per small kernel (NF4 decode +1.9%); est. total <0.2 s/run of ~4.9 s own-kernel time, below A/B noise; production configs kept",
+  "SOUP_MLP_OFFLOAD=0 (GPU store)": "A/B caad3ea 4 rounds: wall -5.76 s CI [-5.97,-5.27], peak +1006 MiB (4775); below the agreed >=9 s threshold for the memory loss",
+  "EXP-013 SOUP_EXP_PARENT_CACHE": "A/B caad3ea: wall -0.85 s CI [-1.06,-0.15], first step -0.91 s; not adopted: its own T4 acceptance test failed on d1bd86f (parent cache RuntimeError) and no time for a fixed full2 before deadline"
  }
 }

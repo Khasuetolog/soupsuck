@@ -453,8 +453,9 @@ are recorded explicitly below.
 | --- | --- | ---: | --- |
 | Out-of-process Triton precompile + launch trim (EXP-001/004) | −1.80 [−5.96, −1.60]; 3 pairs, `d5dc84b` | +4 (3,765 → 3,769) | historical default adoption |
 | Prebuilt native CPU launchers in the compile child (EXP-010) | **−3.33 [−3.66, −2.86]**; first step 6.53 → 2.93 s | 0 | **default (`96a890c`)** |
-| Parent launcher warm-up (EXP-013) | −0.41 [−1.31, +1.16]; first step −0.68 | 0 | not adopted (CI crosses 0) |
+| Parent launcher warm-up (EXP-013) | −0.85 [−1.06, −0.15]; first step −0.91 s (4 rounds, `caad3ea`) | 0 | not adopted: its own T4 acceptance test failed |
 | High-priority offload copy streams (EXP-015) | −0.25 [−0.50, +0.30] | 0 | not adopted (noise) |
+| Keep MLP gate/up on GPU, no offload (`SOUP_MLP_OFFLOAD=0`) | −5.76 [−5.97, −5.27] (4 rounds, `caad3ea`) | **+1,006** (4,775) | rejected: memory ratio 3.81× → 3.00× outweighs 1.10× faster under the score formula with a conservative best-team speed |
 | Faster packed NF4 decode kernel (EXP-006) | −0.06 [−0.53, +0.25] | 0 | not adopted (noise) |
 | Single autograd boundary for the LoRA pair (EXP-008) | +0.25 [−0.62, +0.55] | 0 | rejected |
 | Offload gate + input, recompute up (EXP-009) | +2.06 [+0.97, +2.38] | −82 | rejected: slower |
