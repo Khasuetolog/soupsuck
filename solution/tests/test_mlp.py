@@ -14,6 +14,8 @@ TOLERANCE = dict(rtol=2e-3, atol=2e-3)
 
 @pytest.fixture(autouse=True)
 def explicit_mode_environment(monkeypatch):
+    monkeypatch.setenv("SOUP_EXP_PRECOMPILE", "0")
+    monkeypatch.setenv("SOUP_EXP_LAUNCH_TRIM", "0")
     monkeypatch.setenv("SOUP_MLP_OFFLOAD", "0")  # store cases are explicit, independent of production default
     for key in ("SOUP_MLP_RECOMPUTE", "SOUP_MLP_RECOMPUTE_LAYERS"):
         monkeypatch.delenv(key, raising=False)

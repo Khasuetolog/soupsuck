@@ -1,4 +1,9 @@
-"""Compose the differentiable head with detached TRL/Rewind statistics."""
+"""Compose the differentiable head with detached TRL/Rewind statistics.
+
+Launch trim defaults on; SOUP_EXP_LAUNCH_TRIM=0 selects the original copies.
+Wave2 d5dc84b trim+process precompile: 67.69 vs 69.55 s wall, paired delta
+-1.80 s (CI [-5.96,-1.60]), unchanged eval and passing bitwise gates.
+"""
 
 import os
 
@@ -30,7 +35,7 @@ def fused_head(hidden, weight, labels, num_items_in_batch=None, *, packed_head=N
     from soup_cli.utils.stream_loss_chunk import ChunkedStep
     from .kernels.cross_entropy import fused_linear_cross_entropy
 
-    trim = os.environ.get("SOUP_EXP_LAUNCH_TRIM") == "1"
+    trim = os.environ.get("SOUP_EXP_LAUNCH_TRIM") != "0"
     targets = _shift_targets(labels, trim)
     packed = packed_head is not None and packed_head.matches(hidden, labels)
     if packed:

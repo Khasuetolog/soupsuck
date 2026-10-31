@@ -1,4 +1,4 @@
-"""EXP-001 opt-in, host ownership, real cache hits and unchanged kernel bits."""
+"""Default process preparation, explicit opt-out, ownership and cache bits."""
 
 import ast
 from contextlib import nullcontext
@@ -10,10 +10,16 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 
-def test_default_apply_keeps_preparation_and_heavy_imports_cold():
+@pytest.fixture(autouse=True)
+def explicit_legacy_environment(monkeypatch):
+    monkeypatch.setenv('SOUP_EXP_PRECOMPILE', '0')
+    monkeypatch.setenv('SOUP_EXP_LAUNCH_TRIM', '0')
+
+
+def test_explicit_opt_out_keeps_preparation_and_heavy_imports_cold():
     code = '''
 import os, sys
-os.environ.pop('SOUP_EXP_PRECOMPILE', None)
+os.environ['SOUP_EXP_PRECOMPILE'] = '0'
 import solution
 solution.apply()
 solution.apply()
@@ -69,7 +75,7 @@ def test_compiler_options_match_production_presence_and_insertion_order():
             assert keys == ('num_warps', 'enable_fp_fusion')
 
 
-def test_start_is_literal_opt_in_and_idempotent(monkeypatch):
+def test_thread_mode_and_literal_zero_opt_out_are_idempotent(monkeypatch):
     import solution.precompile as prep
 
     monkeypatch.setattr(prep, '_STATE', dict(started=False, compiled=0, pinned_pairs=0,
@@ -78,9 +84,8 @@ def test_start_is_literal_opt_in_and_idempotent(monkeypatch):
     called = []
     monkeypatch.setattr(prep, '_compile', lambda: called.append('compile'))
     monkeypatch.setattr(prep, '_pinned', lambda: called.append('pinned'))
-    for value in ('0', 'true', ''):
-        monkeypatch.setenv('SOUP_EXP_PRECOMPILE', value)
-        assert not prep.start()
+    monkeypatch.setenv('SOUP_EXP_PRECOMPILE', '0')
+    assert not prep.start()
     monkeypatch.setenv('SOUP_EXP_PRECOMPILE', '1')
     assert prep.start()
     assert not prep.start()
@@ -89,7 +94,8 @@ def test_start_is_literal_opt_in_and_idempotent(monkeypatch):
     assert sorted(called) == ['compile', 'pinned']
 
 
-def test_process_requires_run_cache_and_uses_spawn_inherited_env(monkeypatch, tmp_path):
+@pytest.mark.parametrize('setting', [None, 'process', 'other', ''])
+def test_default_process_requires_run_cache_and_uses_spawn_inherited_env(monkeypatch, tmp_path, setting):
     import solution.precompile as prep
     import multiprocessing
 
@@ -98,7 +104,10 @@ def test_process_requires_run_cache_and_uses_spawn_inherited_env(monkeypatch, tm
     monkeypatch.setattr(prep, '_THREADS', [])
     monkeypatch.setattr(prep, '_PROCESS', None)
     monkeypatch.setattr(prep, '_PROCESS_RESULT', None)
-    monkeypatch.setenv('SOUP_EXP_PRECOMPILE', 'process')
+    if setting is None:
+        monkeypatch.delenv('SOUP_EXP_PRECOMPILE')
+    else:
+        monkeypatch.setenv('SOUP_EXP_PRECOMPILE', setting)
     monkeypatch.delenv('TRITON_CACHE_DIR', raising=False)
     assert not prep.start()
     assert 'TRITON_CACHE_DIR' in prep.status()['errors'][0]
@@ -133,6 +142,23 @@ def test_process_requires_run_cache_and_uses_spawn_inherited_env(monkeypatch, tm
     assert spec['args'][1] == cache_dir
     assert dict(TRITON_CACHE_DIR=cache_dir) in seen
     assert not Path(cache_dir).exists()  # start never creates or substitutes a cache
+
+
+@pytest.mark.parametrize('setting', [None, '0', '1', 'process', 'other', ''])
+def test_install_prepares_by_default_and_only_zero_disables(monkeypatch, setting):
+    import solution.patch as patch
+
+    calls = []
+    fake = ModuleType('solution.precompile')
+    fake.start = lambda: calls.append('start')
+    monkeypatch.setitem(sys.modules, 'solution.precompile', fake)
+    monkeypatch.setattr(patch, '_TARGET_MODULES', set())
+    if setting is None:
+        monkeypatch.delenv('SOUP_EXP_PRECOMPILE')
+    else:
+        monkeypatch.setenv('SOUP_EXP_PRECOMPILE', setting)
+    patch.install()
+    assert len(calls) == (0 if setting == '0' else 1)
 
 
 def test_process_child_failure_report_is_bounded_and_checks_cache_identity(monkeypatch):

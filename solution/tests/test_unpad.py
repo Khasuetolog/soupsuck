@@ -14,6 +14,12 @@ import pytest
 from solution import unpad
 
 
+@pytest.fixture(autouse=True)
+def explicit_legacy_environment(monkeypatch):
+    monkeypatch.setenv("SOUP_EXP_PRECOMPILE", "0")
+    monkeypatch.setenv("SOUP_EXP_LAUNCH_TRIM", "0")
+
+
 @pytest.mark.parametrize("rows,expected", [
     ([[1, 1, 1], [1, 0, 0]], (3, 1)),
     ([[1], [1]], (1, 1)),
@@ -813,6 +819,8 @@ def _run_joint_acceptance(backend):
     os.environ["SOUP_FUSED_NORM_FP16"] = "1"
     os.environ.pop("SOUP_MLP_RECOMPUTE", None)
     os.environ["SOUP_MLP_OFFLOAD"] = "0"
+    os.environ["SOUP_EXP_PRECOMPILE"] = "0"
+    os.environ["SOUP_EXP_LAUNCH_TRIM"] = "0"
     os.environ.pop("SOUP_MLP_RECOMPUTE_LAYERS", None)
     solution.apply()
     solution.apply()

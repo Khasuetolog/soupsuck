@@ -6,6 +6,12 @@ torch = pytest.importorskip("torch")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+@pytest.fixture(autouse=True)
+def explicit_legacy_environment(monkeypatch):
+    monkeypatch.setenv("SOUP_EXP_PRECOMPILE", "0")
+    monkeypatch.setenv("SOUP_EXP_LAUNCH_TRIM", "0")
+
+
 @pytest.mark.parametrize("base_dtype", [torch.float16, torch.float32])
 @pytest.mark.parametrize("adapter_dtype", [torch.float16, torch.float32])
 @pytest.mark.parametrize("cast_to_result", [False, True])

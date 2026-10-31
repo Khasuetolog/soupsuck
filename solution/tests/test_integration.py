@@ -12,6 +12,12 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def explicit_legacy_environment(monkeypatch):
+    monkeypatch.setenv("SOUP_EXP_PRECOMPILE", "0")
+    monkeypatch.setenv("SOUP_EXP_LAUNCH_TRIM", "0")
+
+
 def test_cold_apply_does_not_import_training_dependencies():
     code = """
 import sys

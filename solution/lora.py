@@ -21,6 +21,10 @@ dropout(x16.float()) can differ numerically from dropout(x32). Also bnb
 0.50.2 nn/modules.py:580-590 returns the input dtype, so an fp16 input can
 change the final add's dtype. These rounding effects require GPU/quality
 validation; no bitwise end-to-end equivalence is claimed for fp16 input.
+
+Launch trim defaults on; only SOUP_EXP_LAUNCH_TRIM=0 disables it. Combined
+with process precompile in wave2 d5dc84b: wall 67.69 vs 69.55 s, paired
+delta -1.80 s (CI [-5.96,-1.60]), unchanged eval and passing bitwise gates.
 """
 
 from functools import wraps
@@ -41,7 +45,7 @@ def _read_only_base_result(layer, result):
     output while the adapter runs. The certified unpad Dropout binding only
     scatters its own input and does not mutate this result.
     """
-    if os.environ.get("SOUP_EXP_LAUNCH_TRIM") != "1" or not result.is_contiguous():
+    if os.environ.get("SOUP_EXP_LAUNCH_TRIM") == "0" or not result.is_contiguous():
         return False
     base = layer.base_layer
     if (type(base).__module__ != "bitsandbytes.nn.modules" or type(base).__name__ != "Linear4bit"

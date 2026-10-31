@@ -7,6 +7,11 @@ Pinned source anchors (paths relative to the installed site-packages):
   soup_cli/trainer/rewind_hf.py:338-354 (super call then STEP_ATTR)
 The dynamic Rewind subclass resolves super().compute_loss on the patched TRL
 class, so no setup wrapper or dynamically generated class needs replacing.
+
+Process precompile and launch trim default on after wave2 d5dc84b: wall
+67.69 vs 69.55 s (paired delta -1.80 s, CI [-5.96,-1.60]), unchanged eval
+and passing bitwise gates. SOUP_EXP_PRECOMPILE=0 disables preparation;
+SOUP_EXP_LAUNCH_TRIM=0 restores the untrimmed path.
 """
 
 from contextlib import contextmanager
@@ -460,13 +465,13 @@ class _PatchFinder:
 
 
 def install():
-    """Register targeted post-import patches, without importing heavy packages.
+    """Register targeted post-import patches and start measured-run preparation.
 
     Python calls exec_module before returning the imported module to its caller;
     dynamic Soup subclasses therefore see patched TRL methods. Modules imported
     before apply are handled immediately; markers keep both paths idempotent.
-    No CUDA kernel is imported or compiled here by default. The explicit
-    EXP-001 flag starts measured-run preparation on background threads.
+    Preparation defaults to a spawned compiler in the measured run cache;
+    SOUP_EXP_PRECOMPILE=0 disables it, and =1 selects the older thread mode.
     """
     global _IMPORT_FINDER
     if _IMPORT_FINDER is None:
@@ -476,7 +481,7 @@ def install():
         module = sys.modules.get(name)
         if module is not None:
             _register_module(name, module)
-    if os.environ.get("SOUP_EXP_PRECOMPILE") in ("1", "process"):
+    if os.environ.get("SOUP_EXP_PRECOMPILE") != "0":
         from .precompile import start
 
         start()

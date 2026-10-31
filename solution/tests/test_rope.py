@@ -5,6 +5,12 @@ from types import ModuleType
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def explicit_legacy_environment(monkeypatch):
+    monkeypatch.setenv("SOUP_EXP_PRECOMPILE", "0")
+    monkeypatch.setenv("SOUP_EXP_LAUNCH_TRIM", "0")
+
+
 @pytest.fixture
 def cuda_runtime():
     torch = pytest.importorskip("torch")

@@ -32,7 +32,8 @@ def run(report):
         raise RuntimeError("Pinned bitsandbytes 0.50.2 required")
     os.environ.pop("SOUP_FUSED_DISABLE", None)
     os.environ["SOUP_UNPAD"] = "1"
-    for key in ("SOUP_EXP_PRECOMPILE", "SOUP_EXP_NF4_GEMM", "SOUP_MLP_RECOMPUTE",
+    os.environ["SOUP_EXP_PRECOMPILE"] = "0"
+    for key in ("SOUP_EXP_NF4_GEMM", "SOUP_MLP_RECOMPUTE",
                 "SOUP_MLP_RECOMPUTE_LAYERS"):
         os.environ.pop(key, None)
     solution.apply(); solution.apply()
@@ -47,7 +48,10 @@ def run(report):
             raise AssertionError(f"{name}: not bitwise equal; max_abs={float(error.max())}")
 
     def snapshot(wrapped, raw, ids, labels, mask, initial, trim):
-        os.environ["SOUP_EXP_LAUNCH_TRIM"] = "1" if trim else "0"
+        if trim is None:  # exercise the actual production default
+            os.environ.pop("SOUP_EXP_LAUNCH_TRIM", None)
+        else:
+            os.environ["SOUP_EXP_LAUNCH_TRIM"] = "1" if trim else "0"
         torch.cuda.set_rng_state(initial)
         wrapped.zero_grad(set_to_none=True)
         sdpa_calls, bases, epilogues = [], [], []
@@ -110,7 +114,7 @@ def run(report):
                 ids, labels, mask = _batch(torch, "cuda", lengths, 9)
                 initial = torch.cuda.get_rng_state()
                 reference, calls, clones = snapshot(wrapped, raw, ids, labels, mask, initial, False)
-                actual, changed_calls, aliases = snapshot(wrapped, raw, ids, labels, mask, initial, True)
+                actual, changed_calls, aliases = snapshot(wrapped, raw, ids, labels, mask, initial, None)
                 for key in ("loss", "token_loss", "entropy", "correct", "labelled", "rng", "num_tokens"):
                     bits(actual[key], reference[key], key)
                 assert actual["grads"].keys() == reference["grads"].keys()
@@ -178,6 +182,29 @@ def test_launch_trim_bnb_bitwise_outputs_gradients_rng_and_aliases(tmp_path):
         assert case["clones_removed"] == 4  # two layers, q/v adapters
         assert case["sdpa_calls"] == 8  # four rows per layer
         assert case["lora_gradient_tensors"] == 8  # A/B for four adapters
+
+
+def test_launch_trim_default_and_literal_zero_opt_out(monkeypatch):
+    from types import SimpleNamespace
+    from solution.lora import _read_only_base_result
+
+    class Module:
+        def __init__(self):
+            self._forward_hooks, self._forward_pre_hooks = {}, {}
+            self._backward_hooks, self._backward_pre_hooks = {}, {}
+        def parameters(self):
+            return ()
+    base_type = type("Linear4bit", (Module,), {"__module__": "bitsandbytes.nn.modules"})
+    layer = SimpleNamespace(base_layer=base_type(), active_adapters=["default"],
+        lora_A={"default": Module()}, lora_B={"default": Module()},
+        lora_dropout={"default": Module()})
+    result = SimpleNamespace(is_contiguous=lambda: True)
+    for setting in (None, "0", "1", "other", ""):
+        if setting is None:
+            monkeypatch.delenv("SOUP_EXP_LAUNCH_TRIM", raising=False)
+        else:
+            monkeypatch.setenv("SOUP_EXP_LAUNCH_TRIM", setting)
+        assert _read_only_base_result(layer, result) == (setting != "0")
 
 
 if __name__ == "__main__":

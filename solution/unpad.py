@@ -21,6 +21,10 @@ differ by normal fp16 rounding, so end-to-end tolerances need T4 validation.
 SOUP_UNPAD=0 disables the path for A/B comparisons. Production defaults on
 once explicitly registered; this module imports no torch/Triton at import time.
 No own gather kernel is necessary: index_select/index_copy preserve autograd.
+
+Launch trim defaults on; SOUP_EXP_LAUNCH_TRIM=0 restores the original copies.
+Wave2 d5dc84b trim+process precompile: wall 67.69 vs 69.55 s, paired delta
+-1.80 s (CI [-5.96,-1.60]), unchanged eval and passing bitwise gates.
 """
 
 from contextlib import contextmanager
@@ -373,7 +377,7 @@ def _patch_attention(module):
         value = self.v_proj(hidden_states).view(shape).transpose(1, 2)
         query, key = module.apply_rotary_pos_emb(query, key, *position_embeddings)
         rows, start = [], 0
-        trim = os.environ.get("SOUP_EXP_LAUNCH_TRIM") == "1" and query.is_cuda
+        trim = os.environ.get("SOUP_EXP_LAUNCH_TRIM") != "0" and query.is_cuda
         for length in batch.lengths:
             if length not in batch.causal_masks:
                 batch.causal_masks[length] = torch.ones(

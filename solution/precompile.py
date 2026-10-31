@@ -1,8 +1,13 @@
-"""EXP-001/005: measured-run, opt-in preparation; no CUDA kernel launches.
+"""Measured-run process preparation by default; no CUDA kernel launches.
 
-Triton 3.6 runtime/jit.py:695-736 obtains the current CUDA device/stream even
-for warmup. Thus this DOES initialize CUDA, on a background thread, before
-model loading completes. warmup=True skips kernel.run; _do_compile:826-854
+Wave2 d5dc84b process+launch trim: wall 67.69 vs 69.55 s, paired delta
+-1.80 s, CI [-5.96,-1.60], unchanged eval and passing bitwise gates.
+Only SOUP_EXP_PRECOMPILE=0 disables preparation; =1 retains the thread mode.
+Every other value, including an unset variable, selects process mode.
+
+In the optional thread mode, Triton 3.6 runtime/jit.py:695-736 obtains the
+current CUDA device/stream even for warmup, initializing CUDA before model
+loading completes. warmup=True skips kernel.run; _do_compile:826-854
 inserts the binary in the ordinary JITFunction.device_caches[device][0].
 MockTensor supplies pointer dtype/alignment without allocating device tensors.
 All files use the caller's current TRITON_CACHE_DIR; no persistent cache is
@@ -365,11 +370,12 @@ def _run(name, function):
 
 
 def start():
-    """Start once for 1 (thread) or process (spawn); default remains cold."""
+    """Start once: process by default, literal 1 for thread, only 0 disables."""
     global _PROCESS, _PROCESS_RESULT
     mode = os.environ.get('SOUP_EXP_PRECOMPILE')
-    if mode not in ('1', 'process'):
+    if mode == '0':
         return False
+    mode = '1' if mode == '1' else 'process'
     with _LOCK:
         if _STATE['started']:
             return False
