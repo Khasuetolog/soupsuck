@@ -21,7 +21,8 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPERIMENT_VALUES = {"SOUP_EXP_PRECOMPILE": frozenset({"1", "process"})}
+EXPERIMENT_VALUES = {"SOUP_EXP_PRECOMPILE": frozenset({"1", "process"}),
+                     "SOUP_MLP_OFFLOAD": frozenset({"0"})}
 METRICS = ("wall_s", "loop_s", "first_step_s", "median_step_s", "peak_mib", "eval_loss", "own_share")
 CSV_FIELDS = (
     "experiment", "commit", "owner", "family", "params", "wall_s", "loop_s", "first_step_s",
@@ -34,7 +35,7 @@ CSV_FIELDS = (
 
 def validate_experiment_flag(key, value):
     """Share the explicit opt-in allowlist between --variants and --env."""
-    if (not re.fullmatch(r"SOUP_EXP_[A-Z][A-Z0-9_]*", key)
+    if ((not re.fullmatch(r"SOUP_EXP_[A-Z][A-Z0-9_]*", key) and key not in EXPERIMENT_VALUES)
             or value not in EXPERIMENT_VALUES.get(key, {"1"})):
         raise ValueError("experiment flags require SOUP_EXP_NAME=1; "
                          "SOUP_EXP_PRECOMPILE also accepts process")
