@@ -7,3 +7,9 @@ __pycache__/
 .pytest_cache/
 .ipynb_checkpoints/
 orchestration/runtime.local.json
+
+.DS_Store
+team-share/
+.soup-crashes/
+*.env
+kaggle.json
