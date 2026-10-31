@@ -23,21 +23,45 @@
    "unit": "runs_kaggle/*unit_96a890c_promote010* (518 passed, 1 skipped; Soup 79)",
    "ab": "runs_kaggle/*ab_457cf41_exp006-010* (EXP-010 -3.33 s)"
   },
-  "previous": "f4de4e4"
+  "previous": "f4de4e4",
+  "confirm_f1cb5ac": {
+   "full2": {
+    "solution_wall_s": [
+     66.64,
+     65.14
+    ],
+    "base_wall_s": [
+     89.63,
+     84.22
+    ],
+    "speedup": 1.3192,
+    "memory_ratio": 3.806,
+    "eval_delta_pct": 0.003,
+    "checks": "10/10",
+    "unit": "518 passed, 1 skipped"
+   }
+  }
  },
  "BEST_MEMORY_EXPERIMENT": {
-  "commit": "aaca49c",
-  "env": {
-   "SOUP_EXP_OFFLOAD_RECOMPUTE_UP": "1"
+  "commit": "ec92454",
+  "env": "default GPU store",
+  "full2": {
+   "solution_wall_s": [
+    61.5,
+    61.94
+   ],
+   "base_wall_s": [
+    89.13,
+    80.59
+   ],
+   "peak_mib": 4775,
+   "speedup": 1.3749,
+   "memory_ratio": 3.0042,
+   "eval_delta_pct": -0.003,
+   "own_share_pct": 15.3,
+   "checks": "10/10"
   },
-  "ab_session": "s-ab-aaca49c-exp008-009",
-  "peak_mib_delta": -82,
-  "wall_s_delta_median": 2.06,
-  "wall_s_ci95": [
-   0.965,
-   2.375
-  ],
-  "status": "not promoted: slower"
+  "status": "not submitted: lower score under 35ln(s)/ln(S)+30ln(m)/ln(M) for every plausible best-team S,M"
  },
  "promotion_rule": "Zero speed regression: a candidate replaces BEST_VALIDATED only if paired same-session A/B wall time is not slower (median diff <= 0, CI upper bound not clearly > 0) AND peak memory is not higher, then full2 + check_rules 10/10. Memory-only wins stay in BEST_MEMORY_EXPERIMENT. Target peak 2.3-2.8 GiB, runtime <= 71.0 s (preferred < 68 s).",
  "rejected": {

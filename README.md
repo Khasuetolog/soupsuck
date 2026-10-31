@@ -19,6 +19,10 @@ on solution commit **`96a890c`**:
 
 The submitted commit `f1cb5ac` has `solution/` byte-identical to the measured `96a890c` (`git diff 96a890c f1cb5ac -- solution/` is empty); later commits only touch docs and `tools/`. A confirmation `full2` of `d1bd86f`, which still carried the opt-in EXP-013/015 code, also passed 10/10 (1.283×, 3,769 MiB, +0.004 %) but its solution took 69.21 s against a similar base (88.81 s); since that code bought nothing, we removed it and submit the measured `96a890c` code.
 
+A second `full2` on the submitted `f1cb5ac` itself also passed 10/10: solution 66.64 / 65.14 s, base 89.63 / 84.22 s, **1.319×**, 3,769 MiB (3.806×), eval +0.003 %; solution suite 518 passed, 1 skipped.
+
+We also ran `full2` with MLP activations kept on the GPU (`ec92454`, offload off): 10/10, **61.72 s, 1.375×**, but 4,775 MiB (**3.004×**). Under the score formula 35·ln(s)/ln(S) + 30·ln(m)/ln(M) it scores lower than the offload default for any plausible best-team S and M (e.g. S = 1.7, M = 3.806: 45.7 vs 48.3), so we submit the lower-memory configuration. `SOUP_MLP_OFFLOAD=0` reproduces the faster variant.
+
 Correctness on the same T4 stack: **518 passed, 1 skipped** solution tests
 (the skipped one belongs to a rejected opt-in experiment) and **79/79** Soup
 regression tests with `apply()` (check 10).
