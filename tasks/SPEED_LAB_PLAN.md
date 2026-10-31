@@ -32,3 +32,6 @@ The ≈24 s outside the training loop is mostly model loading and Soup setup tha
 | EXP-001 | Codex-1 | G/I | First step costs 8.7 s more than the base (Triton JIT + init). Compile our kernels for the known shapes in background threads during Soup's model load (CPU compile overlaps I/O-bound loading; still inside the measured run, no cache reuse). Target −5..8 s wall. |
 | EXP-002 | Codex-2 | F | NF4 decode + dense-weight GEMM: fuse dequantization into a Triton GEMM for the M>1536 forward fallback and backward dX (no dense W round trip), compare against decode+cuBLAS per shape. |
 | EXP-003 | Codex-3 | infra | Paired A/B runner: one Kaggle session runs N variants interleaved (env flags) with the base, records wall/loop/first-step/peak, writes registry/results; statistics to tell gains from noise. |
+
+## Checkpointing check (2026-10-31)
+Gradient checkpointing is off (trainer.gradient_checkpointing=False in full2 410c4e9 metrics; task.yaml does not set it) and our MLP recompute is off by default, so there is no activation recomputation in backward to optimize. Next: quantized linear backward profiling (S-042).
