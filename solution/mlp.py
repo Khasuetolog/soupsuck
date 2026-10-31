@@ -68,6 +68,15 @@ The single upload buffer still waits for its prior D2H before overwrite;
 removing that dependency would corrupt data or require another upload buffer.
 No speed claim is made until paired T4 measurements.
 
+EXP-009: SOUP_EXP_OFFLOAD_RECOMPUTE_UP=1 offloads fp16 gate+x instead
+of gate+up and rebuilds only up_proj's value during backward. The original
+projection GradientEdges still supply dx. At H1536/I8960, PCIe bytes and
+CUDA staging shrink by 41.4%; one additional frozen up forward is required.
+Only expansion widths I>=2H select this mode, leaving staging headroom for
+the transient rebuilt up. No additional GPU activation survives forward.
+The opt-in defaults off and does not override full/partial recompute or tail
+store. GPU speed and peak memory require measurement before promotion.
+
 No RNG operation is added; LoRA wrappers, trainable weights, custom projections
 or hooks, and unsupported precision use the original forward. Higher-order
 gradients are not supported. Retained first-order graphs can be replayed.
@@ -94,9 +103,10 @@ _MODE_LOCK = threading.RLock()
 
 
 class _HostSlot:
-    def __init__(self, capacity, width):
+    def __init__(self, capacity, width, second_width=None):
         self.gate = torch.empty((capacity, width), dtype=torch.float16, pin_memory=True)
-        self.up = torch.empty_like(self.gate, pin_memory=True)
+        self.up = (torch.empty_like(self.gate, pin_memory=True) if second_width is None
+                   else torch.empty((capacity, second_width), dtype=torch.float16, pin_memory=True))
         self.produced = torch.cuda.Event()
         self.written = torch.cuda.Event()
         self.read = torch.cuda.Event()
@@ -105,10 +115,15 @@ class _HostSlot:
         self.leased = False
 
 
+class _InputHostSlot(_HostSlot):
+    """Narrow input slots bypass precompile's existing full-width pair factory."""
+
+
 class _DeviceSlot:
-    def __init__(self, capacity, width, device):
+    def __init__(self, capacity, width, device, second_width=None):
         self.gate = torch.empty((capacity, width), device=device, dtype=torch.float16)
-        self.up = torch.empty_like(self.gate)
+        self.up = (torch.empty_like(self.gate) if second_width is None
+                   else torch.empty((capacity, second_width), device=device, dtype=torch.float16))
         self.ready = torch.cuda.Event()
         self.used = torch.cuda.Event()
         self.has_use = False
@@ -117,21 +132,27 @@ class _DeviceSlot:
 
 
 class _OffloadPool:
-    def __init__(self, device, width, capacity, slots, lookahead=1):
+    def __init__(self, device, width, capacity, slots, lookahead=1, input_width=None):
         self.device, self.width, self.capacity = device, width, capacity
         self.lookahead = lookahead
+        self.recompute_up = input_width is not None
+        self.second_width = width if input_width is None else input_width
+        self.host_factory = (_HostSlot if input_width is None else
+                             lambda capacity, width: _InputHostSlot(capacity, width, input_width))
         self.lock = threading.RLock()
         with torch.cuda.device(device):
             self.d2h = torch.cuda.Stream(device=device)
             self.h2d = torch.cuda.Stream(device=device)
-            self.host = [_HostSlot(capacity, width) for _ in range(slots)]
+            self.host = [self.host_factory(capacity, width) for _ in range(slots)]
             self.upload_gate = torch.empty((capacity, width), device=device, dtype=torch.float16)
-            self.upload_up = torch.empty_like(self.upload_gate)
+            self.upload_up = (torch.empty_like(self.upload_gate) if input_width is None else
+                              torch.empty((capacity, input_width), device=device, dtype=torch.float16))
             self.upload_free = torch.cuda.Event()
             # Includes prior uses of storage recycled on this allocation stream.
             self.upload_free.record(torch.cuda.current_stream(device))
             with torch.cuda.stream(self.h2d):
-                self.staging = [_DeviceSlot(capacity, width, device) for _ in range(lookahead + 1)]
+                self.staging = [_DeviceSlot(capacity, width, device, input_width)
+                                for _ in range(lookahead + 1)]
         self.last = None
         self.host_allocations = slots
         self.prefetches = 0
@@ -139,7 +160,7 @@ class _OffloadPool:
     def reserve(self, count):
         with self.lock:
             for _ in range(max(0, count - len(self.host))):
-                self.host.append(_HostSlot(self.capacity, self.width))
+                self.host.append(self.host_factory(self.capacity, self.width))
                 self.host_allocations += 1
 
     def store(self, gate, up):
@@ -200,7 +221,8 @@ class _OffloadPool:
                 # Independent concurrent backward streams may require more than
                 # two slots. Never evict a buffer currently read by a kernel.
                 with torch.cuda.stream(self.h2d):
-                    slot = _DeviceSlot(self.capacity, self.width, self.device)
+                    slot = _DeviceSlot(self.capacity, self.width, self.device,
+                                       self.second_width if self.recompute_up else None)
                 self.staging.append(slot)
             slot.owner = weakref.ref(ticket)
             slot.in_use = required
@@ -274,7 +296,8 @@ class _OffloadTicket:
         self.compute_stream.wait_event(slot.ready)
         slot.gate.record_stream(self.compute_stream)
         slot.up.record_stream(self.compute_stream)
-        return (slot.gate[:self.rows].view(self.shape), slot.up[:self.rows].view(self.shape))
+        second_shape = (*self.shape[:-1], self.pool.second_width)
+        return (slot.gate[:self.rows].view(self.shape), slot.up[:self.rows].view(second_shape))
 
     def release_device(self):
         with self.pool.lock:
@@ -309,6 +332,8 @@ def _pool_for(mlp, x, reserve=None, max_rows=None):
     if tail:
         total = getattr(mlp, "_solution_mlp_layer_count", total)
     lookahead = 2 if tail else 1
+    input_width = (x.shape[-1] if os.environ.get("SOUP_EXP_OFFLOAD_RECOMPUTE_UP") == "1"
+                   and width >= 2 * x.shape[-1] else None)
     count = reserve if reserve is not None else max(1, total - _partial_count(mlp) - tail)
     with _MODE_LOCK:
         # A resized pool cannot disappear while DMA still touches pinned memory.
@@ -318,14 +343,16 @@ def _pool_for(mlp, x, reserve=None, max_rows=None):
             for s in old.host) or any(s.has_use and not s.used.query() for s in old.staging)]
         pool = _OFFLOAD_POOLS.get(key)
         if (pool is None or pool.capacity < rows or (max_rows is not None and pool.capacity < max_rows)
-                or pool.lookahead != lookahead):
+                or pool.lookahead != lookahead or pool.recompute_up != (input_width is not None)
+                or pool.second_width != (width if input_width is None else input_width)):
             if pool is not None:
                 _RETIRED_POOLS.append(pool)
             # Grow geometrically with packed T, rather than allocating B*S=2048
             # on the first short batch. Explicit preparation remains an upper bound.
             capacity = (max(rows, max_rows) if max_rows is not None
                         else 1 << (max(rows, 1) - 1).bit_length())
-            pool = _OffloadPool(x.device, width, capacity, count, lookahead=lookahead)
+            pool = _OffloadPool(x.device, width, capacity, count, lookahead=lookahead,
+                                input_width=input_width)
             _OFFLOAD_POOLS[key] = pool
         else:
             pool.reserve(count)
@@ -491,7 +518,8 @@ class _FrozenMLP(torch.autograd.Function):
                 gate, up = mlp.gate_proj(proxy), mlp.up_proj(proxy)
                 ctx.projection_edges = ((edge(gate), edge(up)), edge(proxy))
             if offload:
-                ctx.offloaded = _pool_for(mlp, x).store(gate, up)
+                pool = _pool_for(mlp, x)
+                ctx.offloaded = pool.store(gate, x if pool.recompute_up else up)
                 ctx.save_for_backward()
             else:
                 saved_gate, saved_up = gate.detach().to(torch.float16), up.detach().to(torch.float16)
@@ -536,12 +564,25 @@ class _FrozenMLP(torch.autograd.Function):
                     projection_edges = ((edge(gate), edge(up)), edge(proxy))
             elif offloaded is not None:
                 gate, up = offloaded.tensors()
+                if offloaded.pool.recompute_up:
+                    # x was saved in the exact fp16 arithmetic seen by eligible
+                    # projections. Passing half directly also avoids bnb's fp32
+                    # output promotion when the outer residual/input is fp32.
+                    # Keep grad dispatch: bnb 0.50.2 no-grad forwards select a
+                    # different inference GEMM. This temporary leaf aliases the
+                    # staging input; detach the value immediately, since dx uses
+                    # the original forward edges, not this short-lived graph.
+                    with torch.enable_grad(), torch.autocast("cuda", enabled=ctx.amp,
+                                                            dtype=ctx.amp_dtype):
+                        up = ctx.mlp.up_proj(up.detach().requires_grad_(True)).detach()
                 projection_edges = ctx.projection_edges
             else:
                 gate, up = ctx.saved_tensors
                 projection_edges = ctx.projection_edges
             dgate, dup = swiglu_fused_backward(gate, up, dact, ctx.gate_dtype, ctx.up_dtype)
             if offloaded is not None:
+                if offloaded.pool.recompute_up:
+                    del up  # rebuilt value is dead before projection dx/dequantization
                 offloaded.release_device()  # event after the LAST read of gate/up
             outputs, input_edge = projection_edges
             with torch.autocast(device_type="cuda", enabled=False):
