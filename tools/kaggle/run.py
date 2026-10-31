@@ -221,6 +221,74 @@ def start_probe_notebook(notebook):
     return notebook
 
 
+def robust_notebook(notebook):
+    """Add a public-data robustness branch without changing the shared template."""
+    source = ''.join(notebook['cells'][2]['source'])
+    boundary = "    elif MODE == 'layerprof':"
+    if source.count(boundary) != 1:
+        raise ValueError('Notebook branches changed; review robust insertion')
+    branch = r'''    elif MODE == 'robust':
+        rc = command('prepare_data', ['python', 'task/prepare_data.py'], cwd=REPO)
+        assert rc == 0, 'Official data preparation failed; see prepare_data.log'
+        code = r"""import json, random
+from pathlib import Path
+from datasets import load_dataset
+from task.prepare_data import DATASET, REVISION
+out = Path('/kaggle/working/out/robust_train.jsonl')
+ds = load_dataset(DATASET, split='train', revision=REVISION)
+# Exclude both fixed public train rows [0,256) and eval rows [40000,40256).
+indices = sorted(random.Random(15015).sample(range(256,40000), 256))
+with out.open('w', encoding='utf-8') as f:
+    for i in indices:
+        row = ds[i]
+        f.write(json.dumps({k: row[k] for k in ('instruction','input','output')}, ensure_ascii=False)+'\n')
+print(json.dumps({'rows':len(indices),'seed':15015,'first':indices[0],'last':indices[-1]}))
+"""
+        rc = command('robust_subset', ['python', '-c', code], cwd=REPO)
+        assert rc == 0, 'Alternate public training subset generation failed'
+        task_seed = int(json.loads((REPO / 'task' / 'task.yaml').read_text())['training']['seed'])
+        runs = []
+        for name, train_file, seed in (
+            ('seed', REPO / 'data' / 'train.jsonl', task_seed + 1),
+            ('subset', OUT / 'robust_train.jsonl', task_seed),
+        ):
+            result_dir = OUT / 'robust' / name
+            rc = command('robust_' + name,
+                ['python', 'harness/run_task.py', '--repeats', '2', '--train-file', str(train_file),
+                 '--seed', str(seed), '--out', str(result_dir)], cwd=REPO)
+            assert rc == 0, name + ' harness failed; see its run log'
+            rc = command('check_' + name,
+                ['python', 'harness/check_rules.py', '--result', str(result_dir / 'result.json')], cwd=REPO)
+            assert rc == 0, name + ' check_rules failed; see checks.json'
+            result = json.loads((result_dir / 'result.json').read_text())
+            checks = json.loads((result_dir / 'checks.json').read_text())
+            summary = result['summary']
+            base, sol = summary['base'], summary['solution']
+            row = {'case': name, 'seed': seed, 'train_file': str(train_file),
+                   'speedup': base['wall_s'] / sol['wall_s'],
+                   'memory_ratio': base['gpu_peak_mib'] / sol['gpu_peak_mib'],
+                   'eval_delta_pct': 100 * (sol['eval_loss'] - base['eval_loss']) / base['eval_loss'],
+                   'checks_ok': all(item['ok'] for item in checks['checks']),
+                   'checks': checks['checks']}
+            runs.append(row)
+            print('ROBUST RESULT', json.dumps(row, sort_keys=True))
+        (OUT / 'robust.json').write_text(json.dumps({'runs': runs}, indent=2) + '\n')
+'''
+    source = source.replace(boundary, branch + boundary)
+    cleanup = "    shutil.rmtree(OUT / 'layerprof_run' / 'adapter', ignore_errors=True)"
+    if source.count(cleanup) != 1:
+        raise ValueError('Notebook cleanup changed; review robust cleanup')
+    source = source.replace(cleanup, cleanup + '''
+    for case in ('seed', 'subset'):
+        for side in ('base_1', 'solution_1', 'solution_2', 'base_2'):
+            for artifact in ('adapter', 'triton_cache', 'inductor_cache'):
+                shutil.rmtree(OUT / 'robust' / case / side / artifact, ignore_errors=True)''')
+    notebook['cells'][0]['source'] = ['# Robustness runs on alternate seed and public rows\n',
+        'Each case: base, solution, solution, base; followed by check_rules.\n']
+    notebook['cells'][2]['source'] = source.splitlines(keepends=True)
+    return notebook
+
+
 def build_kernel(mode, user, sha, environment=None, tag="", variants=None, rounds=4):
     environment = dict(environment or {})
     directory = Path(tempfile.mkdtemp(prefix="soup-kaggle-kernel-"))
@@ -248,6 +316,8 @@ def build_kernel(mode, user, sha, environment=None, tag="", variants=None, round
         notebook = cpu_token_notebook(notebook)
     elif mode == 'startprobe':
         notebook = start_probe_notebook(notebook)
+    elif mode == 'robust':
+        notebook = robust_notebook(notebook)
     notebook["cells"][1]["source"] = [
         f"MODE = {mode!r}\n", f"EXPECTED_SHA = {sha!r}\n",
         f"DATASET = {metadata['dataset_sources'][0]!r}\n",
@@ -273,6 +343,13 @@ def terminal_status(output):
 
 
 def summarize(directory):
+    for path in sorted(directory.rglob('robust.json')):
+        value = json.loads(path.read_text())
+        print('Robustness results:', path.relative_to(directory))
+        for row in value.get('runs', []):
+            print(f"{row['case']}: speedup {row['speedup']:.3f}x, memory ratio "
+                  f"{row['memory_ratio']:.3f}x, eval delta {row['eval_delta_pct']:+.3f}%, "
+                  f"check_rules {'PASS' if row['checks_ok'] else 'FAIL'}")
     for path in sorted(directory.rglob('start_probe.json')):
         if __package__:
             from .start_probe import print_table
@@ -449,7 +526,7 @@ def main():
     push = commands.add_parser("push-code", help="Publish committed HEAD as a private Kaggle dataset")
     push.set_defaults(handler=push_code)
     launch = commands.add_parser("run", help="Run a private notebook and download its outputs")
-    launch.add_argument("--mode", choices=("unit", "solution", "full", "full2", "probe", "bench", "ab", "layerprof", "tokstats", "startprobe"), required=True)
+    launch.add_argument("--mode", choices=("unit", "solution", "full", "full2", "probe", "bench", "ab", "layerprof", "tokstats", "startprobe", "robust"), required=True)
     launch.add_argument("--dry-run", action="store_true", help="Build notebook/metadata without invoking Kaggle")
     launch.add_argument("--env", action="append", type=env_pair, default=[], metavar="SOUP_KEY=VALUE",
                         help="Repeatable; SOUP_EXP_* accepts 1 (PRECOMPILE also process); SOUP_APPLY_SOLUTION is reserved")
