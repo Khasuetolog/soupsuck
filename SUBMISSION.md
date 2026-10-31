@@ -2,9 +2,9 @@
 
 ## Links
 
-- Repository, final commit: `https://github.com/Khasuetolog/soupsuck/commit/<FINAL_COMMIT>`
+- Repository, final commit: `https://github.com/Khasuetolog/soupsuck/commit/f1cb5ac32ef7cbd1caf8455c833b67bd43992ed8`
 - Public Kaggle notebook, saved version: `<KAGGLE_LINK>`
-- Notebook `COMMIT`: `<FINAL_COMMIT>`; the same saved-version link is in [README.md](README.md).
+- Notebook `COMMIT`: `f1cb5ac32ef7cbd1caf8455c833b67bd43992ed8`; the same saved-version link is in [README.md](README.md).
 
 ## Team
 
@@ -42,7 +42,7 @@ To reproduce the two-repeat `full2` evidence after installing pinned dependencie
 and preparing data, from the repository root:
 
 ```bash
-git checkout <FINAL_COMMIT>
+git checkout f1cb5ac32ef7cbd1caf8455c833b67bd43992ed8
 python -m pytest solution -q
 SOUP_APPLY_SOLUTION=1 python -m pytest tests -q
 python harness/run_task.py --repeats 2
@@ -50,7 +50,7 @@ python harness/check_rules.py
 python harness/score.py runs/result.json
 ```
 
-Use the [Kaggle template](templates/kaggle_notebook.ipynb), `COMMIT=<FINAL_COMMIT>`,
+Use the [Kaggle template](templates/kaggle_notebook.ipynb), `COMMIT=f1cb5ac32ef7cbd1caf8455c833b67bd43992ed8`,
 GPU T4 and one GPU through the harness. Run defaults without SOUP overrides.
 
 ## Limitations

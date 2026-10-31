@@ -17,6 +17,8 @@ on solution commit **`96a890c`**:
 | Own Triton kernel share, steps 3 onward | — | 13.3 % (lowest run) | Check 4 PASS |
 | Harness checks | — | **10/10 PASS** | `ALL CHECKS PASSED` |
 
+The submitted commit `f1cb5ac` has `solution/` byte-identical to the measured `96a890c` (`git diff 96a890c f1cb5ac -- solution/` is empty); later commits only touch docs and `tools/`. A confirmation `full2` of `d1bd86f`, which still carried the opt-in EXP-013/015 code, also passed 10/10 (1.283×, 3,769 MiB, +0.004 %) but its solution took 69.21 s against a similar base (88.81 s); since that code bought nothing, we removed it and submit the measured `96a890c` code.
+
 Correctness on the same T4 stack: **518 passed, 1 skipped** solution tests
 (the skipped one belongs to a rejected opt-in experiment) and **79/79** Soup
 regression tests with `apply()` (check 10).
@@ -28,7 +30,7 @@ one session. Whole-run optimization deltas below come from *paired* same-session
 A/B rounds; microbenchmarks, estimates and historical comparisons are labelled separately.
 
 - Public Kaggle notebook, saved version: `<KAGGLE_LINK>`
-- Final submission commit: `<FINAL_COMMIT>`
+- Final submission commit: `f1cb5ac32ef7cbd1caf8455c833b67bd43992ed8`
 - Submission links and team: [SUBMISSION.md](SUBMISSION.md)
 
 ## Where the time goes
@@ -351,7 +353,7 @@ are used by this implementation.
 1. Use the repository assigned by the hackathon platform. Import
    [`templates/kaggle_notebook.ipynb`](templates/kaggle_notebook.ipynb) into Kaggle.
 2. Select **GPU T4 x2**, enable Internet, and set `REPO_URL` to the repository
-   URL and `COMMIT` to `<FINAL_COMMIT>`. The harness uses one GPU. For a private
+   URL and `COMMIT` to `f1cb5ac32ef7cbd1caf8455c833b67bd43992ed8`. The harness uses one GPU. For a private
    repository, configure the read-only `GITHUB_TOKEN` Kaggle secret as the
    template describes.
 3. Run all cells with the template unchanged. Its training cell runs
