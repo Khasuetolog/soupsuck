@@ -195,6 +195,32 @@ finally:
     return notebook
 
 
+def start_probe_notebook(notebook):
+    """Add only the diagnostic branch to this mode's rendered notebook."""
+    source = ''.join(notebook['cells'][2]['source'])
+    boundary = "    elif MODE == 'layerprof':"
+    if source.count(boundary) != 1:
+        raise ValueError('Notebook branches changed; review startprobe insertion')
+    branch = '''    elif MODE == 'startprobe':
+        rc = command('prepare_data', ['python', 'task/prepare_data.py'], cwd=REPO)
+        assert rc == 0, 'Data preparation failed; see prepare_data.log'
+        command('start_probe', ['python', 'tools/kaggle/start_probe.py',
+                                '--out', str(OUT / 'startprobe_run'),
+                                '--commit', EXPECTED_SHA], cwd=REPO)
+'''
+    source = source.replace(boundary, branch + boundary)
+    cleanup = "    shutil.rmtree(OUT / 'layerprof_run' / 'adapter', ignore_errors=True)"
+    if source.count(cleanup) != 1:
+        raise ValueError('Notebook cleanup changed; review startprobe cleanup')
+    source = source.replace(cleanup, cleanup + '''
+    for name in ('adapter', 'triton_cache', 'inductor_cache'):
+        shutil.rmtree(OUT / 'startprobe_run' / name, ignore_errors=True)''')
+    notebook['cells'][0]['source'] = ['# Startup/save/exit diagnostic probe\n',
+        'One instrumented official solution train; not a jury timing run.\n']
+    notebook['cells'][2]['source'] = source.splitlines(keepends=True)
+    return notebook
+
+
 def build_kernel(mode, user, sha, environment=None, tag="", variants=None, rounds=4):
     environment = dict(environment or {})
     directory = Path(tempfile.mkdtemp(prefix="soup-kaggle-kernel-"))
@@ -220,6 +246,8 @@ def build_kernel(mode, user, sha, environment=None, tag="", variants=None, round
         metadata['enable_gpu'] = False
         metadata.pop('machine_shape')
         notebook = cpu_token_notebook(notebook)
+    elif mode == 'startprobe':
+        notebook = start_probe_notebook(notebook)
     notebook["cells"][1]["source"] = [
         f"MODE = {mode!r}\n", f"EXPECTED_SHA = {sha!r}\n",
         f"DATASET = {metadata['dataset_sources'][0]!r}\n",
@@ -245,6 +273,13 @@ def terminal_status(output):
 
 
 def summarize(directory):
+    for path in sorted(directory.rglob('start_probe.json')):
+        if __package__:
+            from .start_probe import print_table
+        else:
+            from start_probe import print_table
+        print('Startup probe:', path.relative_to(directory))
+        print_table(json.loads(path.read_text()))
     for path in sorted(directory.rglob('token_stats.json')):
         if __package__:
             from .token_stats import print_table
@@ -414,7 +449,7 @@ def main():
     push = commands.add_parser("push-code", help="Publish committed HEAD as a private Kaggle dataset")
     push.set_defaults(handler=push_code)
     launch = commands.add_parser("run", help="Run a private notebook and download its outputs")
-    launch.add_argument("--mode", choices=("unit", "solution", "full", "full2", "probe", "bench", "ab", "layerprof", "tokstats"), required=True)
+    launch.add_argument("--mode", choices=("unit", "solution", "full", "full2", "probe", "bench", "ab", "layerprof", "tokstats", "startprobe"), required=True)
     launch.add_argument("--dry-run", action="store_true", help="Build notebook/metadata without invoking Kaggle")
     launch.add_argument("--env", action="append", type=env_pair, default=[], metavar="SOUP_KEY=VALUE",
                         help="Repeatable; SOUP_EXP_* accepts 1 (PRECOMPILE also process); SOUP_APPLY_SOLUTION is reserved")
