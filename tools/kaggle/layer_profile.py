@@ -24,6 +24,8 @@ import traceback
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_META = {"family": "other", "phase": "forward", "layer": "global", "projection": "none"}
+_PROBE_OWNER = '_layer_profile_owner'
+_MISSING = object()
 
 
 def save(path, value):
@@ -110,6 +112,7 @@ class Recorder:
         self.node_handles, self.patches, self.optimizer_handles = [], [], []
         self.errors, self.installed = [], []
         self.shapes = defaultdict(int)
+        self.instrumented = False
 
     @contextmanager
     def scope(self, **updates):
@@ -141,9 +144,17 @@ class Recorder:
 
     def patch(self, obj, name, wrapper, *, static=False):
         original = getattr(obj, name)
-        self.patches.append((obj, name, original, static))
+        owner = getattr(original, _PROBE_OWNER, None)
+        if owner is self:
+            return False
+        if owner is not None:
+            raise RuntimeError(f'{name} is already instrumented by another recorder; restore it first')
+        # Preserve the actual descriptor/inheritance, not only its bound value.
+        self.patches.append((obj, name, vars(obj).get(name, _MISSING)))
+        setattr(wrapper, _PROBE_OWNER, self)
         setattr(obj, name, staticmethod(wrapper) if static else wrapper)
         self.installed.append(f"{getattr(obj, '__name__', type(obj).__name__)}.{name}")
+        return True
 
     def wrap_function(self, obj, name, category, *, family=None):
         original = getattr(obj, name)
@@ -255,18 +266,61 @@ class Recorder:
         self.active = False
         for handle in self.node_handles + self.optimizer_handles:
             handle.remove()
-        for obj, name, original, static in reversed(self.patches):
-            setattr(obj, name, staticmethod(original) if static else original)
+        self.node_handles.clear()
+        self.optimizer_handles.clear()
+        while self.patches:
+            obj, name, descriptor = self.patches.pop()
+            if descriptor is _MISSING:
+                delattr(obj, name)
+            else:
+                setattr(obj, name, descriptor)
+        self.instrumented = False
+
+
+def materialize_mlp(rec, qwen, mlp):
+    """Resolve solution.patch's identity-sensitive lazy trampoline first.
+
+    Its CUDA branch checks cls.forward is the trampoline before installation,
+    then dispatches via cls.forward. An outer probe wrapper breaks that check
+    and causes wrapper -> trampoline -> wrapper recursion on the first batch.
+    This invokes the same installer, without a dummy forward or CUDA warmup.
+    """
+    cls = qwen.Qwen2MLP
+    forward = cls.forward
+    if getattr(forward, _PROBE_OWNER, None) is not None:
+        raise RuntimeError('Qwen2MLP is already instrumented; restore the owning recorder first')
+    # wraps() deliberately reports Qwen2's module/name; inspect the actual code
+    # object instead of decorator metadata (also covered by the CPU regression).
+    code = getattr(forward, '__code__', None)
+    if (code is not None and code.co_qualname == '_patch_lazy_mlp.<locals>.forward'
+            and Path(code.co_filename).resolve() == ROOT / 'solution/patch.py'):
+        original = getattr(forward, '_solution_fused_original')
+        descriptor = vars(cls).get('forward', _MISSING)
+        cls.forward = original
+        try:
+            if not mlp.patch_qwen2_mlp_fused():
+                raise RuntimeError('failed to materialize the solution fused MLP')
+        except BaseException:
+            if descriptor is _MISSING:
+                delattr(cls, 'forward')
+            else:
+                cls.forward = descriptor
+            raise
+        rec.patches.append((cls, 'forward', descriptor))
+        rec.installed.append('Qwen2MLP.materialize_lazy')
 
 
 def instrument(rec):
     """Install after solution's post-import patches, before constructing the model."""
+    if rec.instrumented:
+        return False
     torch = rec.torch
     bnb = importlib.import_module('bitsandbytes')
     backend = importlib.import_module('bitsandbytes.backends.cuda.ops')
     functions = importlib.import_module('bitsandbytes.autograd._functions')
     qwen = importlib.import_module('transformers.models.qwen2.modeling_qwen2')
     mlp = importlib.import_module('solution.mlp')
+    materialize_mlp(rec, qwen, mlp)
 
     def module_wrapper(cls, family, category=None, *, lora=False):
         original = cls.forward
@@ -390,6 +444,8 @@ def instrument(rec):
                 return copy(destination, source, *args, **kwargs)
         return copy(destination, source, *args, **kwargs)
     rec.patch(torch.Tensor, 'copy_', copy_)
+    rec.instrumented = True
+    return True
 
 
 @contextmanager
@@ -448,11 +504,14 @@ def worker(args):
     sys.path.insert(0, str(ROOT))
     sys.path.insert(0, str(ROOT / 'harness'))
     from _train import TRAINER_ARGS, plain
-    sys.argv = ['soup', 'train', '--config', str(args.config), '--yes']
+    # --verbose is a ROOT Soup option, before train; its error handler would
+    # otherwise swallow the Python traceback and only print a friendly line.
+    sys.argv = ['soup', '--verbose', 'train', '--config', str(args.config), '--yes']
     sys.modules['unsloth'] = None
     sys.modules['unsloth_zoo'] = None
     report = dict(ok=False, probe=True, commit=args.commit, step_window=[8, 24], step_numbering='1-based, inclusive',
-                  errors=[], note='CUDA region timings include instrumentation/CPU launch gaps; not jury results')
+                  errors=[], soup_argv=list(sys.argv),
+                  note='CUDA region timings include instrumentation/CPU launch gaps; not jury results')
     rec = None
     path = args.out / 'layer_profile.json'
     save(path, report)
@@ -567,6 +626,8 @@ def driver(args):
     run_dir.mkdir(exist_ok=False)
     task = official.load_task()
     config = official.make_config(run_dir, ROOT / 'data/train.jsonl', task['training']['seed'])
+    crash_root = ROOT / '.soup-crashes'
+    existing_crashes = set(crash_root.glob('*.crash'))
     try:
         official.warm_up(run_dir)
         with tempfile.TemporaryDirectory(prefix='soup-layerprof-cold-') as cache:
@@ -580,24 +641,198 @@ def driver(args):
                       source_task=official.load_task(), command=command,
                       cache_policy='fresh temporary Triton/Inductor directories; removed after this probe')
         report['ok'] = bool(report.get('ok')) and code == 0
+        if not report['ok']:
+            # The notebook captures THIS process into layer_profile.log. Echo
+            # the full worker output, not a tail, so Soup's verbose traceback
+            # remains visible there as well as in layerprof_run/train.log.
+            print('=== failed layerprof worker: full train.log / traceback ===', flush=True)
+            print((run_dir / 'train.log').read_text(errors='replace')
+                  if (run_dir / 'train.log').exists() else 'Worker log missing', flush=True)
         save(report_path, report)
         print_table(report)
         return 0 if report['ok'] else 1
     except (Exception, SystemExit):
-        save(report_path, {'ok':False, 'error':traceback.format_exc(), 'probe':True, 'commit':args.commit})
+        error = traceback.format_exc()
+        print(error, file=sys.stderr, flush=True)
+        save(report_path, {'ok':False, 'error':error, 'probe':True, 'commit':args.commit})
         return 1
     finally:
+        for path in sorted(set(crash_root.glob('*.crash')) - existing_crashes):
+            if path.is_file() and not path.is_symlink():
+                target = args.out / 'layerprof_crashes' / path.name
+                target.parent.mkdir(exist_ok=True)
+                shutil.copy2(path, target)
         shutil.rmtree(run_dir / 'adapter', ignore_errors=True)
+
+
+def self_test():
+    """CPU regression using the ACTUAL lazy/concrete installer source bodies.
+
+    Fake pinned APIs replace CUDA math, but the solution's identity checks,
+    markers and trampoline code execute unchanged. No torch import is needed.
+    """
+    import ast
+    from types import ModuleType, SimpleNamespace
+    from unittest.mock import patch
+
+    def functions(path, names, namespace):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        selected = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+        assert len(selected) == len(names)
+        exec(compile(ast.Module(body=selected, type_ignores=[]), str(path), 'exec'), namespace)
+
+    class Module:
+        def forward(self, x):
+            return x
+
+    class Linear(Module):
+        def forward(self, x):
+            return x + 1
+
+    class Linear4bit(Linear):
+        def forward(self, x):
+            return super().forward(x)
+
+    class Input(int):
+        is_cuda = True  # exercise the CUDA *branch*, on a plain CPU integer
+
+    class Tensor:
+        def copy_(self, source, *args, **kwargs):
+            return self
+
+    class Stream:
+        def wait_event(self, event):
+            pass
+
+    class Function:
+        @staticmethod
+        def forward(ctx, x, *args, **kwargs):
+            return x
+
+        @staticmethod
+        def backward(ctx, grad, *args, **kwargs):
+            return grad
+
+    class Ticket:
+        def tensors(self):
+            return None
+
+    class Pool:
+        def store(self, *args, **kwargs):
+            return Ticket()
+
+        def prefetch(self, ticket, *args, **kwargs):
+            return None
+
+    def identity(x, *args, **kwargs):
+        return x
+
+    torch = SimpleNamespace(nn=SimpleNamespace(Module=Module, Linear=Linear,
+                                              functional=SimpleNamespace(linear=identity,
+                                                                         scaled_dot_product_attention=identity)),
+                            Tensor=Tensor, cuda=SimpleNamespace(Stream=Stream), matmul=identity)
+    qwen = ModuleType('transformers.models.qwen2.modeling_qwen2')
+    for name in ('Qwen2Attention', 'Qwen2DecoderLayer', 'Qwen2MLP', 'Qwen2RMSNorm'):
+        setattr(qwen, name, type(name, (Module,), {'__module__': qwen.__name__}))
+    qwen.Qwen2MLP.forward = lambda self, x: x + 10
+    mlp = ModuleType('solution.mlp')
+    calls = []
+    concrete_namespace = dict(__name__='solution.mlp', ModuleType=ModuleType, torch=torch,
+                              importlib=SimpleNamespace(import_module=lambda name: qwen), wraps=wraps,
+                              _MARKER='_solution_fused_original', enabled=lambda: True,
+                              _eligible=lambda module, x: True,
+                              fused_qwen2_mlp=lambda module, x: calls.append('fused') or x + 20)
+    functions(ROOT / 'solution/mlp.py', {'patch_qwen2_mlp_fused'}, concrete_namespace)
+    mlp.patch_qwen2_mlp_fused = concrete_namespace['patch_qwen2_mlp_fused']
+    lazy_namespace = dict(__name__='solution.patch', wraps=wraps, _MARKER='_solution_fused_original',
+                          enabled=lambda: True)
+    functions(ROOT / 'solution/patch.py', {'_mark', '_patch_lazy_mlp'}, lazy_namespace)
+    lazy_namespace['_patch_lazy_mlp'](qwen.Qwen2MLP)
+    lazy = qwen.Qwen2MLP.forward
+    package = ModuleType('solution')
+    package.__path__ = []
+    with patch.dict(sys.modules, {'solution': package, 'solution.mlp': mlp}):
+        # Prove the pre-fix chain fails: replacing cls.forward prevents the
+        # lazy installer from seeing itself, and it redispatches to the probe.
+        @wraps(lazy)
+        def broken(module, x):
+            return lazy(module, x)
+        qwen.Qwen2MLP.forward = broken
+        try:
+            qwen.Qwen2MLP().forward(Input(2))
+        except RecursionError:
+            pass
+        else:
+            raise AssertionError('lazy trampoline regression was not reproduced')
+        finally:
+            qwen.Qwen2MLP.forward = lazy
+
+        mlp._FrozenMLP = type('FrozenMLP', (Function,), {})
+        mlp._OffloadPool, mlp._OffloadTicket = Pool, Ticket
+        modules = {'bitsandbytes': SimpleNamespace(nn=SimpleNamespace(Linear4bit=Linear4bit),
+                                                  functional=SimpleNamespace(dequantize_4bit=identity)),
+                   'bitsandbytes.backends.cuda.ops': SimpleNamespace(**{name: identity for name in
+                       ('_dequantize_4bit_impl', '_dequantize_blockwise_impl', '_dequant_linear_fallback', '_gemm_4bit_kernel_impl')}),
+                   'bitsandbytes.autograd._functions': SimpleNamespace(MatMul4Bit=type('MatMul4Bit', (Function,), {})),
+                   qwen.__name__: qwen, 'solution.mlp': mlp,
+                   'solution.kernels.swiglu_fused': SimpleNamespace(swiglu_fused_forward=identity, swiglu_fused_backward=identity)}
+        for module, name in (('cross_entropy', '_FrozenLinearCrossEntropy'), ('rmsnorm', '_RMSNorm'),
+                             ('add_rmsnorm', '_AddRMSNorm'), ('rope', '_RoPE')):
+            modules['solution.kernels.' + module] = SimpleNamespace(**{name: type(name, (Function,), {})})
+        recorder = Recorder(torch)
+        original_linear, original_bnb = Linear.forward, Linear4bit.forward
+        with patch.object(importlib, 'import_module', side_effect=lambda name: modules[name]):
+            try:
+                assert instrument(recorder) is True
+                installed = (qwen.Qwen2MLP.forward, Linear4bit.forward, Linear.forward)
+                count = len(recorder.patches)
+                assert instrument(recorder) is False
+                assert installed == (qwen.Qwen2MLP.forward, Linear4bit.forward, Linear.forward)
+                assert len(recorder.patches) == count
+                lazy_namespace['_patch_lazy_mlp'](qwen.Qwen2MLP)
+                assert mlp.patch_qwen2_mlp_fused() is True
+                assert installed == (qwen.Qwen2MLP.forward, Linear4bit.forward, Linear.forward)
+                assert qwen.Qwen2MLP().forward(Input(2)) == 22 and calls == ['fused']
+                concrete_namespace['_eligible'] = lambda module, x: False
+                assert qwen.Qwen2MLP().forward(Input(2)) == 12  # original fallback
+                assert Linear4bit().forward(2) == 3  # preserved super/Linear chain
+                assert qwen.Qwen2Attention().forward(2) == 2
+                try:
+                    instrument(Recorder(torch))
+                except RuntimeError as exc:
+                    assert 'already instrumented' in str(exc)
+                else:
+                    raise AssertionError('nested recorder installation accepted')
+            finally:
+                recorder.restore()
+            recorder.restore()  # double cleanup is harmless
+            assert qwen.Qwen2MLP.forward is lazy
+            assert Linear.forward is original_linear and Linear4bit.forward is original_bnb
+            # Reinstall after restoration, then exercise the same lazy chain.
+            concrete_namespace['_eligible'] = lambda module, x: True
+            try:
+                assert instrument(recorder) is True
+                assert qwen.Qwen2MLP().forward(Input(2)) == 22
+            finally:
+                recorder.restore()
+    print('PASS: reproduced lazy recursion; double install, real solution installer/marker chain, '
+          'fused/fallback calls, Linear4bit super chain, owner rejection, restore/reinstall (CPU only)')
+    return 0
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--out', type=Path)
+    parser.add_argument('--self-test', action='store_true', help='CPU-only lazy-wrapper/idempotence regression')
     parser.add_argument('--commit', default='unknown')
     parser.add_argument('--timeout', type=int, default=1800)
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--config', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.self_test:
+        return self_test()
+    if args.out is None:
+        parser.error('--out is required unless --self-test')
     args.out = args.out.resolve()
     if args.worker and args.config is None:
         parser.error('--worker requires --config')
