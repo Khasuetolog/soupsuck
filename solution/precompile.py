@@ -173,6 +173,9 @@ def plans():
     for nested in (False, True):
         add('nf4', 'nf4_decode_kernel',
             (u, u if nested else f, f, f, f, f, h, 1536*8960, nested, 2048))
+        if os.environ.get('SOUP_EXP_NF4_FAST') == '1':
+            add('nf4', 'nf4_decode_fast_kernel',
+                (u, u if nested else f, f, f, f, f, h, 1536*8960, nested, 4096), num_warps=8)
     return result
 
 
