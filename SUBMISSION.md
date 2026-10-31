@@ -1,4 +1,4 @@
-# Submission: <TEAM_NAME>
+# Submission
 
 ## Links
 
@@ -10,7 +10,10 @@
 
 | Name | Role | GitHub | Kaggle | Contact |
 | --- | --- | --- | --- | --- |
-| `<NAME>` | `<ROLE>` | `<GITHUB>` | `<KAGGLE>` | `<CONTACT>` |
+| Ахметжан Хасен | Engineer | — | — | — |
+| Anuarbek Islam | Software Developer | — | — | — |
+| Omirali Amirkhan | Engineer | — | — | — |
+| Zholdykaraeva Amina | Software Developer | — | — | — |
 
 ## Final result
 
