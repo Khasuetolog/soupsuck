@@ -34,10 +34,6 @@ The keep-graph query is verified in torch 2.11 torch/csrc/autograd/init.cpp;
 older versions
 conservatively retain CPU leases until context destruction.
 
-EXP-015: SOUP_EXP_OFFLOAD_STREAMS=1 gives the existing D2H/H2D streams the
-highest CUDA priority supported by the device. This changes scheduling only;
-the stream count, staging buffers, copies and event dependencies are unchanged.
-
 At the task's maximum N and without partial recompute, offload reserves
 28*70=1960 MiB pinned host memory and three CUDA pairs (210 MiB), instead of
 1960 MiB CUDA saved activations.
@@ -144,13 +140,9 @@ class _OffloadPool:
         self.host_factory = (_HostSlot if input_width is None else
                              lambda capacity, width: _InputHostSlot(capacity, width, input_width))
         self.lock = threading.RLock()
-        priority = None
-        if os.environ.get("SOUP_EXP_OFFLOAD_STREAMS") == "1":
-            priority = torch.cuda.Stream.priority_range()[1]
         with torch.cuda.device(device):
-            stream_options = {} if priority is None else {"priority": priority}
-            self.d2h = torch.cuda.Stream(device=device, **stream_options)
-            self.h2d = torch.cuda.Stream(device=device, **stream_options)
+            self.d2h = torch.cuda.Stream(device=device)
+            self.h2d = torch.cuda.Stream(device=device)
             self.host = [self.host_factory(capacity, width) for _ in range(slots)]
             self.upload_gate = torch.empty((capacity, width), device=device, dtype=torch.float16)
             self.upload_up = (torch.empty_like(self.upload_gate) if input_width is None else

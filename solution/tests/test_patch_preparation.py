@@ -13,7 +13,6 @@ def isolated_preparation(monkeypatch):
     import solution.precompile as prep
 
     monkeypatch.setenv('SOUP_EXP_PRECOMPILE', '0')
-    monkeypatch.setenv('SOUP_EXP_PARENT_CACHE', '0')
     monkeypatch.setenv('SOUP_EXP_CPU_LAUNCHERS', '0')
     monkeypatch.setattr(prep, '_STATE', dict(started=False, compiled=0, pinned_pairs=0,
                                           errors=[], finished=[]))
