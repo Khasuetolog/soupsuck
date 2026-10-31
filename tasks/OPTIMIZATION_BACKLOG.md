@@ -8,3 +8,4 @@ Measured on 0c58998 / e0c50a2 (Kaggle T4):
 
 Ideas: cut first-step compile cost (fewer kernel specializations); kernel launch configs from
 `tools/kaggle/bench_kernels.py` (S-029, not run yet); cheaper offload copies.
+- solution/patch.py : the trampoline only installs the fused MLP when ; any external wrapper of Qwen2MLP.forward recurses (found by S-043 probe). Jury path unaffected; harden by materializing on install or tolerating wrappers.
