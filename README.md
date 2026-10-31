@@ -33,7 +33,7 @@ ratio of base to solution inside one session, so every number above comes from
 one session. Whole-run optimization deltas below come from *paired* same-session
 A/B rounds; microbenchmarks, estimates and historical comparisons are labelled separately.
 
-- Public Kaggle notebook, saved version: `<KAGGLE_LINK>`
+- Public Kaggle notebook, saved version: https://www.kaggle.com/code/khasansueta/notebookf3ae4d2bef
 - Final submission commit: `f1cb5ac32ef7cbd1caf8455c833b67bd43992ed8`
 - Submission links and team: [SUBMISSION.md](SUBMISSION.md)
 
@@ -366,7 +366,7 @@ are used by this implementation.
    procedure. The two-repeat evidence reported above comes from a separate
    development `full2` run (base, solution, solution, base), reproducible with
    the local commands or development runner below.
-4. Save the completed notebook version, publish it, and replace `<KAGGLE_LINK>`
+4. Save the completed notebook version, publish it, and replace https://www.kaggle.com/code/khasansueta/notebookf3ae4d2bef
    here and in SUBMISSION with the same saved-version link. Preserve result,
    checks, metrics and logs with that notebook.
 

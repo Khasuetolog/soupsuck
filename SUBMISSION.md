@@ -3,7 +3,7 @@
 ## Links
 
 - Repository, final commit: `https://github.com/Khasuetolog/soupsuck/commit/f1cb5ac32ef7cbd1caf8455c833b67bd43992ed8`
-- Public Kaggle notebook, saved version: `<KAGGLE_LINK>`
+- Public Kaggle notebook, saved version: https://www.kaggle.com/code/khasansueta/notebookf3ae4d2bef
 - Notebook `COMMIT`: `f1cb5ac32ef7cbd1caf8455c833b67bd43992ed8`; the same saved-version link is in [README.md](README.md).
 
 ## Team
