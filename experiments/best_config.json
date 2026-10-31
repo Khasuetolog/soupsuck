@@ -1,19 +1,29 @@
 {
  "BEST_VALIDATED": {
-  "commit": "f4de4e4af48598462eec1418e7f0341744caf071",
+  "commit": "96a890c57a6c9dd28ca92649e27a7a992aa3de51",
   "env": {},
   "full2": {
-   "solution_wall_s": 70.53,
+   "solution_wall_s": [
+    65.11,
+    65.87
+   ],
+   "base_wall_s": [
+    91.37,
+    83.85
+   ],
    "peak_mib": 3769,
-   "speedup": 1.231,
+   "speedup": 1.338,
    "memory_ratio": 3.806,
-   "eval_delta_pct": 0.002,
+   "eval_delta_pct": -0.001,
+   "own_share_pct": 13.3,
    "checks": "10/10"
   },
   "evidence": {
-   "full2": "runs_kaggle/*full2_410c4e9*",
-   "unit": "runs_kaggle/*unit_f4de4e4*"
-  }
+   "full2": "runs_kaggle/*full2_96a890c_promote010*",
+   "unit": "runs_kaggle/*unit_96a890c_promote010* (518 passed, 1 skipped; Soup 79)",
+   "ab": "runs_kaggle/*ab_457cf41_exp006-010* (EXP-010 -3.33 s)"
+  },
+  "previous": "f4de4e4"
  },
  "BEST_MEMORY_EXPERIMENT": {
   "commit": "aaca49c",
@@ -31,6 +41,7 @@
  },
  "promotion_rule": "Zero speed regression: a candidate replaces BEST_VALIDATED only if peak memory is lower AND paired same-session A/B wall time is not slower (median diff <= 0, CI upper bound not clearly > 0), then full2 + check_rules 10/10. Memory-only wins stay in BEST_MEMORY_EXPERIMENT. Target peak 2.3-2.8 GiB, runtime <= 71.0 s (preferred < 68 s).",
  "rejected": {
-  "EXP-008 SOUP_EXP_LORA_PAIR": "aaca49c A/B: wall +0.245 s CI [-0.615,0.55], peak 0: no gain"
+  "EXP-008 SOUP_EXP_LORA_PAIR": "aaca49c A/B: wall +0.245 s CI [-0.615,0.55], peak 0: no gain",
+  "EXP-006 SOUP_EXP_NF4_FAST": "457cf41 A/B: wall -0.055 s CI [-0.53,0.25]: no gain"
  }
 }
