@@ -246,7 +246,8 @@ print(json.dumps({'rows':len(indices),'seed':15015,'first':indices[0],'last':ind
 """
         rc = command('robust_subset', ['python', '-c', code], cwd=REPO)
         assert rc == 0, 'Alternate public training subset generation failed'
-        task_seed = int(json.loads((REPO / 'task' / 'task.yaml').read_text())['training']['seed'])
+        import yaml
+        task_seed = int(yaml.safe_load((REPO / 'task' / 'task.yaml').read_text())['training']['seed'])
         runs = []
         for name, train_file, seed in (
             ('seed', REPO / 'data' / 'train.jsonl', task_seed + 1),
