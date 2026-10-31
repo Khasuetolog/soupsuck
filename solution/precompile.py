@@ -40,6 +40,13 @@ CompiledKernel.run/_init_handles or load cubins. CUDA and Triton driver state
 must still remain uninitialized in the child. The normal first launch reads
 the current run's native launcher cache and initializes its own GPU handles.
 No parent JIT entries, tensors, streams, kernels or compiler options change.
+
+EXP-013: SOUP_EXP_PARENT_CACHE=1 warms the parent's native JIT cache after
+the process compiler succeeds, using MockTensor warmup only. No cubin handles
+or tensors are loaded/allocated. A temporary per-JIT gate serializes warmup
+with the first real call; a JIT already used by production is never warmed
+again. The gate is removed when preparation finishes. The worker is joined
+at process exit and uses only the current run's cache/current CUDA device.
 """
 
 from dataclasses import dataclass
@@ -185,6 +192,82 @@ _PROCESS = None
 _PROCESS_RESULT = None
 _STATE = dict(started=False, compiled=0, pinned_pairs=0, errors=[], finished=[])
 _PINNED = []
+
+
+class _ParentCacheGate:
+    """Do not race JIT cache publication with a production call of the same JIT."""
+    def __init__(self, jit_class):
+        self.jit_class, self.original = jit_class, jit_class.run
+        self.lock = threading.RLock()
+        self.states = {}
+        self.closed = False
+
+        def run(kernel, *args, **kwargs):
+            module = getattr(getattr(kernel, 'fn', None), '__module__', '')
+            if self.closed or not module.startswith('solution.kernels.'):
+                return self.original(kernel, *args, **kwargs)
+            state = self.state(kernel)
+            with state['lock']:
+                if not kwargs.get('warmup', False):
+                    state['used'] = True
+                return self.original(kernel, *args, **kwargs)
+
+        self.wrapper = run
+        jit_class.run = run
+
+    def state(self, kernel):
+        with self.lock:
+            state = self.states.get(kernel)
+            if state is None:
+                state = dict(lock=threading.RLock(), used=False)
+                self.states[kernel] = state
+            return state
+
+    def warm(self, kernel, function):
+        state = self.state(kernel)
+        with state['lock']:
+            if state['used'] or self.closed:
+                return False
+            function()
+            return True
+
+    def close(self):
+        self.closed = True
+        # Another instrumenter may have wrapped run in the meantime. Never
+        # overwrite its wrapper; our closed gate then simply forwards calls.
+        if self.jit_class.run is self.wrapper:
+            self.jit_class.run = self.original
+
+
+def _parent_cache(process, cache_dir, gate, device):
+    """Background native cache hydration; never submits GPU work."""
+    started = time.perf_counter()
+    prepared = skipped = 0
+    try:
+        process.join()
+        wait_s = time.perf_counter() - started
+        if process.exitcode != 0:
+            raise RuntimeError(f'Parent cache requires successful compiler, exitcode={process.exitcode}')
+        if not cache_dir or os.environ.get('TRITON_CACHE_DIR') != cache_dir:
+            raise RuntimeError('Parent cache requires the unchanged run TRITON_CACHE_DIR')
+        import torch
+
+        started = time.perf_counter()
+        with torch.cuda.device(device):
+            for plan in plans():
+                kernel = getattr(importlib.import_module(plan.module), plan.kernel)
+                if gate.warm(kernel, lambda: warmup_plan(plan)):
+                    prepared += 1
+                else:
+                    skipped += 1
+        with _LOCK:
+            _STATE.update(parent_cache_prepared=prepared, parent_cache_skipped=skipped,
+                          parent_cache_wait_s=round(wait_s, 4),
+                          parent_cache_prepare_s=round(time.perf_counter()-started, 4))
+        print(f'[solution] EXP-013 parent cache prepared={prepared} skipped={skipped} '
+              f'elapsed_s={_STATE["parent_cache_prepare_s"]:.4f}', file=sys.stderr, flush=True)
+    finally:
+        gate.close()
 
 
 def status():
@@ -422,26 +505,48 @@ def start():
             _error('process', RuntimeError('Explicit run TRITON_CACHE_DIR is required'))
             return False
         _STATE['started'] = True
+        gate = None
         if mode == 'process':
             import multiprocessing
 
+            cache_dir = os.environ['TRITON_CACHE_DIR']
             context = multiprocessing.get_context('spawn')
             receive, send = context.Pipe(duplex=False)
             process = context.Process(target=_process_compile,
-                args=(send, os.environ['TRITON_CACHE_DIR']), name='soup-precompile-process', daemon=False)
+                args=(send, cache_dir), name='soup-precompile-process', daemon=False)
             try:
+                if os.environ.get('SOUP_EXP_PARENT_CACHE') == '1':
+                    # Inherit the device initialized by the harness before apply;
+                    # never initialize a context merely for this experiment.
+                    torch = sys.modules.get('torch')
+                    if torch is not None and torch.cuda.is_initialized():
+                        from triton.runtime.jit import JITFunction
+
+                        device = torch.cuda.current_device()
+                        gate = _ParentCacheGate(JITFunction)
+                    else:
+                        _STATE['parent_cache_skip_reason'] = 'CUDA context was not initialized before apply'
                 process.start()
             except Exception:
                 receive.close()
                 send.close()
                 _STATE['started'] = False
+                if gate is not None:
+                    gate.close()
                 raise
             send.close()
             _PROCESS, _PROCESS_RESULT = process, receive
         jobs = (('compile', _compile), ('pinned', _pinned)) if mode == '1' else (('pinned', _pinned),)
+        if gate is not None:
+            jobs += (('parent-cache', lambda: _parent_cache(process, cache_dir, gate, device)),)
         for name, fn in jobs:
             thread = threading.Thread(target=_run, args=(name, fn),
-                                      name='soup-precompile-' + name, daemon=True)
+                                      name='soup-precompile-' + name, daemon=name != 'parent-cache')
             _THREADS.append(thread)
-            thread.start()
+            try:
+                thread.start()
+            except Exception:
+                if gate is not None:
+                    gate.close()
+                raise
     return True

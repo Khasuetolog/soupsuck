@@ -13,6 +13,7 @@ import pytest
 @pytest.fixture(autouse=True)
 def explicit_legacy_environment(monkeypatch):
     monkeypatch.setenv('SOUP_EXP_PRECOMPILE', '0')
+    monkeypatch.setenv('SOUP_EXP_PARENT_CACHE', '0')
     monkeypatch.setenv('SOUP_EXP_CPU_LAUNCHERS', '0')
     monkeypatch.setenv('SOUP_EXP_NF4_FAST', '0')
     monkeypatch.setenv('SOUP_EXP_LAUNCH_TRIM', '0')
@@ -239,12 +240,14 @@ def test_pinned_pairs_are_consumed_once_with_original_shape_policy(monkeypatch):
     assert fake._HostSlot(4096, 1000).gate.shape == (4096, 1000)
 
 
-@pytest.mark.parametrize('mode,cpu_launchers,fast',
-                         [('1', False, False), ('process', False, False), ('process', True, False),
-                          ('process', False, True), ('process', True, True)],
+@pytest.mark.parametrize('mode,cpu_launchers,fast,parent_cache',
+                         [('1', False, False, False), ('process', False, False, False),
+                          ('process', True, False, False), ('process', False, True, False),
+                          ('process', True, True, False), ('process', True, False, True)],
                          ids=['thread', 'spawn-disk-cache', 'spawn-cpu-launchers',
-                              'spawn-fast-nf4', 'spawn-fast-nf4-cpu-launchers'])
-def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch, tmp_path, mode, cpu_launchers, fast):
+                              'spawn-fast-nf4', 'spawn-fast-nf4-cpu-launchers', 'spawn-parent-cache'])
+def test_warmup_real_kernel_cache_hits_and_exact_outputs(
+        monkeypatch, tmp_path, mode, cpu_launchers, fast, parent_cache):
     torch = pytest.importorskip('torch')
     if not torch.cuda.is_available():
         pytest.skip('CUDA required')
@@ -263,6 +266,7 @@ def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch, tmp_path, 
     monkeypatch.setenv('SOUP_EXP_PRECOMPILE', mode)
     monkeypatch.setenv('SOUP_EXP_CPU_LAUNCHERS', '1' if cpu_launchers else '0')
     monkeypatch.setenv('SOUP_EXP_NF4_FAST', '1' if fast else '0')
+    monkeypatch.setenv('SOUP_EXP_PARENT_CACHE', '1' if parent_cache else '0')
     monkeypatch.setenv('SOUP_MLP_OFFLOAD', '0')
     monkeypatch.setattr(prep, '_STATE', dict(started=False, compiled=0, pinned_pairs=0,
                                           errors=[], finished=[]))
@@ -293,7 +297,15 @@ def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch, tmp_path, 
             assert state['launchers_prepared'] == len(prep.plans()), state
             assert state['launcher_prepare_s'] >= 0, state
             assert torch.cuda.memory_allocated() == before_allocated
-            assert all(not k.device_caches[device][0] for k in kernels.values())
+            if parent_cache:
+                assert state['parent_cache_prepared'] == len(prep.plans()), state
+                assert state['parent_cache_skipped'] == 0, state
+                assert all(k.device_caches[device][0] for k in kernels.values())
+                # Native warmup only: no CUDA module handles or launches.
+                assert all(binary.module is None and binary.function is None
+                           for k in kernels.values() for binary in k.device_caches[device][0].values())
+            else:
+                assert all(not k.device_caches[device][0] for k in kernels.values())
     seen = set()
     disk_hits, compilation_misses = set(), []
     active = [True]
@@ -332,7 +344,7 @@ def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch, tmp_path, 
             key = compute_cache_key(key_cache, specialization, options)
             # Hook runs inside real JIT.run AFTER debug/instrumentation kwargs
             # are added, and BEFORE cache lookup. No hand-coded D/==1 guesses.
-            assert mode == 'process' or key in cache, (f'precompile missed {case_name[0]} / {name}: '
+            assert (mode == 'process' and not parent_cache) or key in cache, (f'precompile missed {case_name[0]} / {name}: '
                                   f'specialization={specialization!r}, options={options!r}; '
                                   f'prepared_keys={tuple(cache)!r}')
             seen.add(name)
@@ -459,7 +471,8 @@ def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch, tmp_path, 
     assert seen == set(kernels)
     if mode == 'process':
         assert not compilation_misses
-        assert disk_hits == set(kernels), 'every kernel must load a child-built disk artifact'
+        if not parent_cache:
+            assert disk_hits == set(kernels), 'every kernel must load a child-built disk artifact'
         if cpu_launchers:
             assert not native_misses, 'production launch rebuilt a child-prepared CPU launcher'
 
