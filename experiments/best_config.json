@@ -1,1 +1,1 @@
-{"best_known_good":"0c58998478973e2915ad6fc4624aeae52744b933","env":{},"evidence":"runs_kaggle/20261030T173912044822Z_full2_0c58998"}
+{"best_known_good":"f4de4e4af48598462eec1418e7f0341744caf071","env":{},"evidence":{"full2":"runs_kaggle/*full2_410c4e9*","unit":"runs_kaggle/*unit_f4de4e4*"},"note":"solution code identical to 410c4e9 except test_launch_trim.py"}

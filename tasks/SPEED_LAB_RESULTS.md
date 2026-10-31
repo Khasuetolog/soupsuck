@@ -11,3 +11,4 @@
 | wave2 A | d5dc84b default (session base 79.32 s) | 69.55 s | 1.140x | 3765 MiB | unit 334/0/0 | session reference |
 | wave2 D | PRECOMPILE=1 + LAUNCH_TRIM=1 | 69.04 s (Δ −0.59, CI [−4.22, −0.20]) | 1.149x | 3769 MiB | PASS | superseded |
 | wave2 E | PRECOMPILE=process + LAUNCH_TRIM=1 | **67.69 s (Δ −1.80, CI [−5.96, −1.60])** | **1.172x** | 3769 MiB | PASS | **accepted → default (S-040), pending full2** |
+| **NEW BEST** | f4de4e4 (= 410c4e9 code + test fix): process precompile + launch trim default | full2: 70.53 s (base 86.82 s) | 1.231x (session) | 3769 MiB | full2 10/10; unit 345/0/0; Soup 79 | **Best known** (paired gain vs 0c58998-equivalent: −1.80 s, wave2) |
