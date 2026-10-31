@@ -15,6 +15,7 @@ TOLERANCE = dict(rtol=2e-3, atol=2e-3)
 @pytest.fixture(autouse=True)
 def explicit_mode_environment(monkeypatch):
     monkeypatch.setenv("SOUP_EXP_OFFLOAD_TAIL", "0")
+    monkeypatch.setenv("SOUP_EXP_OFFLOAD_STREAMS", "0")
     monkeypatch.setenv("SOUP_EXP_OFFLOAD_RECOMPUTE_UP", "0")
     monkeypatch.setenv("SOUP_EXP_PRECOMPILE", "0")
     monkeypatch.setenv("SOUP_EXP_LAUNCH_TRIM", "0")
@@ -254,6 +255,59 @@ def test_offload_matches_store_bits_and_retained_backward(offload_runtime, amp, 
     assert torch.equal(other.grad, x.grad)
     assert not any(slot.leased for slot in pool.host)
     assert len(pool.staging) == 2
+
+
+def test_offload_priority_streams_match_default_bits_and_peak(offload_runtime, monkeypatch):
+    """Scheduling priority alone preserves values, grads, and CUDA allocation peak."""
+    runtime = offload_runtime
+    torch.manual_seed(215)
+    layer = FrozenMLP(intermediate=1001)
+    runtime.prepare_mlp_offload(layer, max_rows=231)
+    pool = next(iter(runtime._OFFLOAD_POOLS.values()))
+    count_before = len(pool.staging)
+    host_before = pool.host_allocations
+    staging_before = (pool.upload_gate.numel() + pool.upload_up.numel()
+                      + sum(s.gate.numel() + s.up.numel() for s in pool.staging))
+    low, high = torch.cuda.Stream.priority_range()
+    assert pool.d2h.priority == low and pool.h2d.priority == low
+
+    x = torch.randn((3, 77, 64), device="cuda", dtype=torch.float16)
+    upstream = torch.randn((3, 77, 64), device="cuda", dtype=torch.float16)
+
+    def run(setting):
+        monkeypatch.setenv("SOUP_EXP_OFFLOAD_STREAMS", setting)
+        runtime._OFFLOAD_POOLS = {}
+        runtime._RETIRED_POOLS = []
+        runtime._LAYER_ORDERS = {}
+        runtime.prepare_mlp_offload(layer, max_rows=231)
+        active = next(iter(runtime._OFFLOAD_POOLS.values()))
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        inp = x.detach().clone().requires_grad_()
+        output = runtime.fused_qwen2_mlp(layer, inp, recompute=False, offload=True)
+        output.backward(upstream)
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated()
+        return (output.detach().cpu(), inp.grad.detach().cpu(), peak,
+                active.d2h.priority, active.h2d.priority, len(active.staging),
+                active.host_allocations,
+                active.upload_gate.numel() + active.upload_up.numel()
+                + sum(s.gate.numel() + s.up.numel() for s in active.staging))
+
+    (expected, expected_grad, expected_peak, default_d2h, default_h2d,
+     default_staging, default_host, default_bytes) = run("0")
+    runtime._OFFLOAD_POOLS = {}
+    gc.collect()
+    (actual, actual_grad, actual_peak, priority_d2h, priority_h2d,
+     priority_staging, priority_host, priority_bytes) = run("1")
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_grad, expected_grad)
+    assert actual_peak == expected_peak
+    assert default_d2h == default_h2d == low
+    assert priority_d2h == priority_h2d == high
+    assert priority_staging == default_staging == count_before
+    assert priority_host == default_host == host_before
+    assert priority_bytes == default_bytes == staging_before
 
 
 def test_offload_reuses_pinned_buffers_across_different_lengths(offload_runtime):
