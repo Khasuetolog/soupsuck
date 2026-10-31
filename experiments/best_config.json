@@ -1,3 +1,36 @@
-{"BEST_VALIDATED":{"commit":"f4de4e4af48598462eec1418e7f0341744caf071","env":{},"full2":{"solution_wall_s":70.53,"peak_mib":3769,"speedup":1.231,"memory_ratio":3.806,"eval_delta_pct":0.002,"checks":"10/10"},"evidence":{"full2":"runs_kaggle/*full2_410c4e9*","unit":"runs_kaggle/*unit_f4de4e4*"}},
- "BEST_MEMORY_EXPERIMENT":null,
- "promotion_rule":"Zero speed regression: a candidate replaces BEST_VALIDATED only if peak memory is lower AND paired same-session A/B wall time is not slower (median diff <= 0, CI upper bound not clearly > 0), then full2 + check_rules 10/10. Memory-only wins stay in BEST_MEMORY_EXPERIMENT. Target peak 2.3-2.8 GiB, runtime <= 71.0 s (preferred < 68 s)."}
+{
+ "BEST_VALIDATED": {
+  "commit": "f4de4e4af48598462eec1418e7f0341744caf071",
+  "env": {},
+  "full2": {
+   "solution_wall_s": 70.53,
+   "peak_mib": 3769,
+   "speedup": 1.231,
+   "memory_ratio": 3.806,
+   "eval_delta_pct": 0.002,
+   "checks": "10/10"
+  },
+  "evidence": {
+   "full2": "runs_kaggle/*full2_410c4e9*",
+   "unit": "runs_kaggle/*unit_f4de4e4*"
+  }
+ },
+ "BEST_MEMORY_EXPERIMENT": {
+  "commit": "aaca49c",
+  "env": {
+   "SOUP_EXP_OFFLOAD_RECOMPUTE_UP": "1"
+  },
+  "ab_session": "s-ab-aaca49c-exp008-009",
+  "peak_mib_delta": -82,
+  "wall_s_delta_median": 2.06,
+  "wall_s_ci95": [
+   0.965,
+   2.375
+  ],
+  "status": "not promoted: slower"
+ },
+ "promotion_rule": "Zero speed regression: a candidate replaces BEST_VALIDATED only if peak memory is lower AND paired same-session A/B wall time is not slower (median diff <= 0, CI upper bound not clearly > 0), then full2 + check_rules 10/10. Memory-only wins stay in BEST_MEMORY_EXPERIMENT. Target peak 2.3-2.8 GiB, runtime <= 71.0 s (preferred < 68 s).",
+ "rejected": {
+  "EXP-008 SOUP_EXP_LORA_PAIR": "aaca49c A/B: wall +0.245 s CI [-0.615,0.55], peak 0: no gain"
+ }
+}
