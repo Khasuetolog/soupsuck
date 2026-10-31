@@ -253,6 +253,10 @@ def summarize(directory):
         bench = json.loads(path.read_text())
         print("Kernel benchmark:", path.relative_to(directory), "ok:", bench.get("ok"),
               "device:", bench.get("device"))
+        for kernel, winner in bench.get('best_by_kernel', {}).items():
+            print(kernel, 'all-shape config:', json.dumps(winner.get('common_config')),
+                  'geometric mean speedup:', winner.get('geometric_mean_speedup'),
+                  'cases:', winner.get('cases'), 'all cases ok:', winner.get('all_cases_ok'))
         for case, best in bench.get("best", {}).items():
             print(case, json.dumps(best))
         if bench.get("error"):
