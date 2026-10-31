@@ -32,6 +32,14 @@ CUDA context, warmup/launch, tensors, pinned buffers or device cache are used.
 The parent loads these binaries normally on first use. No cache directory is
 created outside the measured run or carried between runs. Non-daemon children
 are joined by multiprocessing at normal parent exit, so their time counts.
+
+EXP-010: SOUP_EXP_CPU_LAUNCHERS=1 also constructs native CPU CudaLauncher
+objects in the existing process compiler, using each binary's exact source
+and metadata. The constructor builds/imports CPU glue only; it does not access
+CompiledKernel.run/_init_handles or load cubins. CUDA and Triton driver state
+must still remain uninitialized in the child. The normal first launch reads
+the current run's native launcher cache and initializes its own GPU handles.
+No parent JIT entries, tensors, streams, kernels or compiler options change.
 """
 
 from dataclasses import dataclass
@@ -217,7 +225,7 @@ def warmup_plan(plan):
     return kernel.warmup(*arguments, grid=(1,), **plan.options)
 
 
-def _offline_compile():
+def _offline_compile(prepare_launchers=False):
     """Compile the SAME native specializations for sm75, without driver.active.
 
     Use explicit backend + create_function_from_signature instead of
@@ -235,9 +243,14 @@ def _offline_compile():
 
     if not triton.__version__.startswith('3.6.'):
         raise RuntimeError('Process preparation supports Triton 3.6.x only')
+    if prepare_launchers:
+        # Constructor builds/imports CPU glue only. CompiledKernel.run would
+        # also load cubins, including unused variants, increasing code memory.
+        from triton.backends.nvidia.driver import CudaLauncher
     target = GPUTarget('cuda', 75, 32)
     backend = make_backend(target)
-    prepared, errors = 0, []
+    prepared, launchers, errors = 0, 0, []
+    binary_seconds = launcher_seconds = 0.0
     for plan in plans():
         try:
             kernel = getattr(importlib.import_module(plan.module), plan.kernel)
@@ -250,8 +263,16 @@ def _offline_compile():
             bound, specialization, options = binder(*args, **kwargs)
             options, signature, constants, attrs = kernel._pack_args(
                 backend, kwargs, bound, specialization, options)
-            triton.compile(ASTSource(kernel, signature, constants, attrs),
-                           target=target, options=options.__dict__)
+            if prepare_launchers:
+                started = time.perf_counter()
+            compiled = triton.compile(ASTSource(kernel, signature, constants, attrs),
+                                      target=target, options=options.__dict__)
+            if prepare_launchers:
+                binary_seconds += time.perf_counter() - started
+                started = time.perf_counter()
+                CudaLauncher(compiled.src, compiled.metadata)
+                launcher_seconds += time.perf_counter() - started
+                launchers += 1
             prepared += 1
         except Exception as exc:
             errors.append(f'{plan.kernel}: {type(exc).__name__}: {exc}')
@@ -261,8 +282,13 @@ def _offline_compile():
         errors.append('Offline compiler unexpectedly initialized torch CUDA')
     if driver_touched:
         errors.append('Offline compiler unexpectedly accessed an active Triton driver')
-    return dict(compiled=prepared, errors=errors, cuda_initialized=initialized,
-                driver_touched=driver_touched)
+    result = dict(compiled=prepared, errors=errors, cuda_initialized=initialized,
+                  driver_touched=driver_touched)
+    if prepare_launchers:
+        result['launchers_prepared'] = launchers
+        result['binary_prepare_s'] = round(binary_seconds, 4)
+        result['launcher_prepare_s'] = round(launcher_seconds, 4)
+    return result
 
 
 def _process_compile(send, cache_dir):
@@ -271,7 +297,14 @@ def _process_compile(send, cache_dir):
     try:
         if not cache_dir or os.environ.get('TRITON_CACHE_DIR') != cache_dir:
             raise RuntimeError('Child must inherit the exact run TRITON_CACHE_DIR')
-        result = _offline_compile()
+        if os.environ.get('SOUP_EXP_CPU_LAUNCHERS') == '1':
+            result = _offline_compile(prepare_launchers=True)
+            print(f"[solution] EXP-010 CPU launchers prepared={result['launchers_prepared']} "
+                  f"binary_s={result['binary_prepare_s']:.4f} "
+                  f"launcher_s={result['launcher_prepare_s']:.4f} "
+                  f"errors={len(result['errors'])}", file=sys.stderr, flush=True)
+        else:
+            result = _offline_compile()
     except Exception as exc:
         result['errors'].append(f'{type(exc).__name__}: {exc}')
     finally:
@@ -305,6 +338,9 @@ def _collect_process():
         _STATE['compiled'] = result['compiled']
         _STATE['child_cuda_initialized'] = result.get('cuda_initialized')
         _STATE['child_driver_touched'] = result.get('driver_touched')
+        for key in ('launchers_prepared', 'binary_prepare_s', 'launcher_prepare_s'):
+            if key in result:
+                _STATE[key] = result[key]
         _STATE['errors'].extend(result['errors'])
         _STATE['finished'].append('compile-process')
         for message in result['errors']:

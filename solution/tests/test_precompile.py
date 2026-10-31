@@ -13,6 +13,7 @@ import pytest
 @pytest.fixture(autouse=True)
 def explicit_legacy_environment(monkeypatch):
     monkeypatch.setenv('SOUP_EXP_PRECOMPILE', '0')
+    monkeypatch.setenv('SOUP_EXP_CPU_LAUNCHERS', '0')
     monkeypatch.setenv('SOUP_EXP_LAUNCH_TRIM', '0')
 
 
@@ -217,8 +218,9 @@ def test_pinned_pairs_are_consumed_once_with_original_shape_policy(monkeypatch):
     assert fake._HostSlot(4096, 1000).gate.shape == (4096, 1000)
 
 
-@pytest.mark.parametrize('mode', ['1', 'process'], ids=['thread', 'spawn-disk-cache'])
-def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch, tmp_path, mode):
+@pytest.mark.parametrize('mode,cpu_launchers', [('1', False), ('process', False), ('process', True)],
+                         ids=['thread', 'spawn-disk-cache', 'spawn-cpu-launchers'])
+def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch, tmp_path, mode, cpu_launchers):
     torch = pytest.importorskip('torch')
     if not torch.cuda.is_available():
         pytest.skip('CUDA required')
@@ -235,6 +237,7 @@ def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch, tmp_path, 
     from solution.kernels.rope import fused_rope
 
     monkeypatch.setenv('SOUP_EXP_PRECOMPILE', mode)
+    monkeypatch.setenv('SOUP_EXP_CPU_LAUNCHERS', '1' if cpu_launchers else '0')
     monkeypatch.setenv('SOUP_MLP_OFFLOAD', '0')
     monkeypatch.setattr(prep, '_STATE', dict(started=False, compiled=0, pinned_pairs=0,
                                           errors=[], finished=[]))
@@ -252,6 +255,7 @@ def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch, tmp_path, 
         monkeypatch.setattr(triton.knobs.cache, 'dir', str(cache_dir))
         for kernel in kernels.values():
             kernel.device_caches[device][0].clear()
+    before_allocated = torch.cuda.memory_allocated()
     assert prep.start()
     state = prep.wait(180)
     assert not state['alive'] and not state['errors'], state
@@ -260,9 +264,24 @@ def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch, tmp_path, 
         assert state['process_exitcode'] == 0, state
         assert state['child_cuda_initialized'] is False, state
         assert state['child_driver_touched'] is False, state
+        if cpu_launchers:
+            assert state['launchers_prepared'] == len(prep.plans()), state
+            assert state['launcher_prepare_s'] >= 0, state
+            assert torch.cuda.memory_allocated() == before_allocated
+            assert all(not k.device_caches[device][0] for k in kernels.values())
     seen = set()
     disk_hits, compilation_misses = set(), []
     active = [True]
+    native_misses = []
+    if cpu_launchers:
+        from triton.runtime import build as native_build
+
+        original_build = native_build._build
+        def count_native_build(name, *args, **kwargs):
+            if active[0] and name == '__triton_launcher':
+                native_misses.append(name)
+            return original_build(name, *args, **kwargs)
+        monkeypatch.setattr(native_build, '_build', count_native_build)
     touched = set()
     case_name = ['']
     previous_listener = triton.knobs.compilation.listener
@@ -410,6 +429,8 @@ def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch, tmp_path, 
     if mode == 'process':
         assert not compilation_misses
         assert disk_hits == set(kernels), 'every kernel must load a child-built disk artifact'
+        if cpu_launchers:
+            assert not native_misses, 'production launch rebuilt a child-prepared CPU launcher'
 
 
 def test_prepared_pinned_storage_preserves_offload_outputs_and_gradients(monkeypatch):
