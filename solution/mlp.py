@@ -21,8 +21,7 @@ backward uses bnb's own dequantization policy; we do not dequantize weights or
 replace bnb's derivative. recompute rebuilds gate/up graphs under the captured
 forward autocast, adding exactly two projection forwards per layer.
 
-Offload is opt-in since the final release (SOUP_MLP_OFFLOAD=1); the default
-keeps fp16 gate/up on the GPU (A/B caad3ea: -5.76 s, +1006 MiB). It
+Offload is enabled by default; only SOUP_MLP_OFFLOAD=0 disables it. It
 transfers compressed gate/up to persistent pinned CPU
 slots. One reusable CUDA upload pair bounds in-flight D2H storage; two CUDA
 download pairs prefetch the current/next backward layer. Events protect every
@@ -601,7 +600,7 @@ def fused_qwen2_mlp(mlp, x, recompute=None, offload=None):
     if recompute is None:
         recompute = os.environ.get("SOUP_MLP_RECOMPUTE") == "1" or _partial_recompute(mlp)
     if offload is None:
-        offload = os.environ.get("SOUP_MLP_OFFLOAD") == "1"
+        offload = os.environ.get("SOUP_MLP_OFFLOAD") != "0"
     offload = bool(offload) and not recompute
     tail_store = offload and _tail_store(mlp)
     offload = offload and not tail_store

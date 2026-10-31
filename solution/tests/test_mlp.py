@@ -382,7 +382,7 @@ def test_offload_explicit_store_and_recompute_priority(offload_runtime, monkeypa
 
 
 @pytest.mark.parametrize("setting", [None, "0", "1", "other"])
-def test_offload_literal_one_opt_in(offload_runtime, monkeypatch, setting):
+def test_offload_default_and_literal_zero_opt_out(offload_runtime, monkeypatch, setting):
     if setting is None:
         monkeypatch.delenv("SOUP_MLP_OFFLOAD", raising=False)
     else:
@@ -390,7 +390,7 @@ def test_offload_literal_one_opt_in(offload_runtime, monkeypatch, setting):
     layer = FrozenMLP(intermediate=256)
     x = torch.randn((2, 5, 64), device="cuda", dtype=torch.float16, requires_grad=True)
     offload_runtime.fused_qwen2_mlp(layer, x).sum().backward()
-    assert bool(offload_runtime._OFFLOAD_POOLS) == (setting == "1")
+    assert bool(offload_runtime._OFFLOAD_POOLS) == (setting != "0")
 
 
 @pytest.mark.parametrize("offload_runtime", [False, True], indirect=True)
