@@ -372,7 +372,7 @@ def _pinned():
     import torch
     from . import mlp
 
-    if os.environ.get('SOUP_MLP_OFFLOAD') == '0' or os.environ.get('SOUP_MLP_RECOMPUTE') == '1':
+    if os.environ.get('SOUP_MLP_OFFLOAD') != '1' or os.environ.get('SOUP_MLP_RECOMPUTE') == '1':
         return
     count = max(0, 28 - min(28, max(0, int(os.environ.get('SOUP_MLP_RECOMPUTE_LAYERS', '0')))))
     original = mlp._HostSlot
