@@ -14,6 +14,7 @@ TOLERANCE = dict(rtol=2e-3, atol=2e-3)
 
 @pytest.fixture(autouse=True)
 def explicit_mode_environment(monkeypatch):
+    monkeypatch.setenv("SOUP_EXP_OFFLOAD_TAIL", "0")
     monkeypatch.setenv("SOUP_EXP_PRECOMPILE", "0")
     monkeypatch.setenv("SOUP_EXP_LAUNCH_TRIM", "0")
     monkeypatch.setenv("SOUP_MLP_OFFLOAD", "0")  # store cases are explicit, independent of production default
@@ -597,3 +598,111 @@ def test_prepare_reserves_only_nonrecomputed_layers(offload_runtime, monkeypatch
     monkeypatch.setenv("SOUP_MLP_RECOMPUTE", "1")
     runtime.prepare_mlp_offload(layers, max_rows=33)
     assert not runtime._OFFLOAD_POOLS
+
+
+@pytest.mark.parametrize("tail", [0, 2, 4, 8])
+@pytest.mark.parametrize("amp", [False, True])
+@pytest.mark.parametrize("bnb", [False, True])
+def test_offload_tail_matches_current_offload_bits_and_replay(offload_runtime, monkeypatch, tail, amp, bnb):
+    runtime = offload_runtime
+    torch.manual_seed(707)
+    layers = torch.nn.ModuleList([FrozenMLP(intermediate=256, bnb=bnb,
+        dtype=torch.float32 if amp else torch.float16) for _ in range(8)])
+    shared = SimpleNamespace(hidden_act="silu", num_hidden_layers=8)
+    for layer in layers:
+        layer.config = shared
+    monkeypatch.setenv("SOUP_MLP_OFFLOAD", "1")
+
+    def bits(a, b):
+        assert a.dtype == b.dtype and a.shape == b.shape
+        assert torch.equal(a.detach().contiguous().view(torch.uint8),
+                           b.detach().contiguous().view(torch.uint8))
+
+    for rows in (17, 33, 5):
+        monkeypatch.setenv("SOUP_EXP_OFFLOAD_TAIL", "0")
+        x = torch.randn((1, rows, 64), device="cuda",
+                        dtype=torch.float32 if amp else torch.float16, requires_grad=True)
+        other = x.detach().clone().requires_grad_()
+        with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+            expected = x
+            for layer in layers:
+                expected = expected + runtime.fused_qwen2_mlp(layer, expected)
+        torch.cuda.synchronize()
+        # Keep reference graph's leases alive; use an independent experiment
+        # pool so mode changes/all-store don't inherit the reference buffers.
+        runtime._OFFLOAD_POOLS.clear()
+        monkeypatch.setenv("SOUP_EXP_OFFLOAD_TAIL", str(tail))
+        offloaded = []
+        with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+            actual = other
+            for layer in layers:
+                branch = runtime.fused_qwen2_mlp(layer, actual)
+                offloaded.append(hasattr(branch.grad_fn, "offloaded"))
+                actual = actual + branch
+        assert offloaded == [i < 8-tail for i in range(8)]
+        if tail < 8:
+            pool = next(iter(runtime._OFFLOAD_POOLS.values()))
+            assert len(pool.host) == 8-tail
+            assert pool.lookahead == (2 if tail else 1)
+            assert len(pool.staging) == (3 if tail else 2)
+        else:
+            assert not runtime._OFFLOAD_POOLS
+        bits(actual, expected)
+        grad = torch.randn_like(actual)
+        expected.backward(grad, retain_graph=True)
+        actual.backward(grad, retain_graph=True)
+        bits(other.grad, x.grad)
+        x.grad, other.grad = None, None
+        expected.backward(grad)
+        actual.backward(grad)
+        bits(other.grad, x.grad)
+        if tail < 8:
+            assert not any(s.leased for s in pool.host)
+        torch.cuda.synchronize()
+
+
+def test_tail_prefetches_two_offloaded_layers_before_required_read(offload_runtime, monkeypatch):
+    runtime = offload_runtime
+    layers = torch.nn.ModuleList([FrozenMLP(intermediate=256) for _ in range(4)])
+    monkeypatch.setenv("SOUP_MLP_OFFLOAD", "1")
+    monkeypatch.setenv("SOUP_EXP_OFFLOAD_TAIL", "2")
+    runtime.prepare_mlp_offload(layers, max_rows=33)
+    pool = next(iter(runtime._OFFLOAD_POOLS.values()))
+    x = torch.randn((1, 17, 64), device="cuda", dtype=torch.float16, requires_grad=True)
+    out, tickets = x, []
+    for layer in layers:
+        branch = runtime.fused_qwen2_mlp(layer, out)
+        if hasattr(branch.grad_fn, "offloaded"):
+            tickets.append(branch.grad_fn.offloaded)
+        out = out + branch
+    calls = []
+    original = pool.prefetch
+    def observed(ticket, required=False):
+        calls.append((ticket, required))
+        return original(ticket, required)
+    monkeypatch.setattr(pool, "prefetch", observed)
+    out.sum().backward()
+    assert calls[:2] == [(tickets[1], False), (tickets[0], False)]
+    assert any(required for _, required in calls[2:])
+    assert len(pool.staging) == 3
+
+
+@pytest.mark.parametrize("partial,tail", [(0, 2), (2, 2), (3, 3), (0, 4)])
+def test_tail_reservation_excludes_recompute_and_tail(offload_runtime, monkeypatch, partial, tail):
+    runtime = offload_runtime
+    layers = torch.nn.ModuleList([FrozenMLP(intermediate=256) for _ in range(4)])
+    monkeypatch.setenv("SOUP_MLP_RECOMPUTE_LAYERS", str(partial))
+    monkeypatch.setenv("SOUP_EXP_OFFLOAD_TAIL", str(tail))
+    runtime.prepare_mlp_offload(layers, max_rows=33)
+    count = max(0, 4-partial-tail)
+    assert sum(len(p.host) for p in runtime._OFFLOAD_POOLS.values()) == count
+    assert [runtime._tail_store(m) for m in layers] == [i >= 4-tail for i in range(4)]
+
+
+@pytest.mark.parametrize("tail", ["-1", "9", "bad"])
+def test_invalid_tail_rejected(offload_runtime, monkeypatch, tail):
+    layer = FrozenMLP(intermediate=256)
+    layer.config.num_hidden_layers = 8
+    monkeypatch.setenv("SOUP_EXP_OFFLOAD_TAIL", tail)
+    with pytest.raises(ValueError, match="SOUP_EXP_OFFLOAD_TAIL"):
+        offload_runtime._tail_store(layer)

@@ -57,6 +57,17 @@ Qwen forward assigns them lazily using its shared config. Full recompute
 overrides partial selection; recomputed layers do not offload. Recompute
 switches default off; explicit SOUP_MLP_OFFLOAD=0 selects store instead.
 
+EXP-007: SOUP_EXP_OFFLOAD_TAIL=k (default 0) keeps the last k depth-ordered
+MLPs in GPU store mode. Full/partial recompute still takes precedence. When
+k>0, offloaded layers use three download pairs for current + two predecessors;
+stored tail backward starts those prefetches before its projection backward.
+At N2048/I8960 this adds 70*k MiB saved GPU data plus one 70 MiB download pair
+when any layer still offloads. The transfer reduction is 70*k MiB D2H
+and 70*k MiB H2D. Packed rows scale actual activation/transfer bytes linearly.
+The single upload buffer still waits for its prior D2H before overwrite;
+removing that dependency would corrupt data or require another upload buffer.
+No speed claim is made until paired T4 measurements.
+
 No RNG operation is added; LoRA wrappers, trainable weights, custom projections
 or hooks, and unsupported precision use the original forward. Higher-order
 gradients are not supported. Retained first-order graphs can be replayed.
@@ -106,8 +117,9 @@ class _DeviceSlot:
 
 
 class _OffloadPool:
-    def __init__(self, device, width, capacity, slots):
+    def __init__(self, device, width, capacity, slots, lookahead=1):
         self.device, self.width, self.capacity = device, width, capacity
+        self.lookahead = lookahead
         self.lock = threading.RLock()
         with torch.cuda.device(device):
             self.d2h = torch.cuda.Stream(device=device)
@@ -119,7 +131,7 @@ class _OffloadPool:
             # Includes prior uses of storage recycled on this allocation stream.
             self.upload_free.record(torch.cuda.current_stream(device))
             with torch.cuda.stream(self.h2d):
-                self.staging = [_DeviceSlot(capacity, width, device) for _ in range(2)]
+                self.staging = [_DeviceSlot(capacity, width, device) for _ in range(lookahead + 1)]
         self.last = None
         self.host_allocations = slots
         self.prefetches = 0
@@ -207,6 +219,15 @@ class _OffloadPool:
             slot.up.record_stream(self.h2d)
             self.prefetches += 1
 
+    def prefetch_chain(self, ticket, count):
+        """Best-effort lookahead only; required readers are never evicted."""
+        with self.lock:
+            for _ in range(count):
+                if ticket is None or ticket.closed:
+                    break
+                self.prefetch(ticket)
+                ticket = ticket.previous() if ticket.previous is not None else None
+
 
 class _OffloadTicket:
     def __init__(self, pool, host, shape, previous):
@@ -233,8 +254,7 @@ class _OffloadTicket:
                 self.device_slot.in_use = True
                 self.compute_stream = torch.cuda.current_stream(self.pool.device)
                 previous = self.previous() if self.previous is not None else None
-                if previous is not None and not previous.closed:
-                    self.pool.prefetch(previous)
+                self.pool.prefetch_chain(previous, self.pool.lookahead)
                 ready = True
             finally:
                 if not ready:
@@ -285,7 +305,11 @@ def _pool_for(mlp, x, reserve=None, max_rows=None):
     rows = x.numel() // x.shape[-1]
     key = (x.device, width)
     total = getattr(getattr(mlp, "config", None), "num_hidden_layers", 1)
-    count = reserve if reserve is not None else max(1, total - _partial_count(mlp))
+    tail = _tail_count(mlp)
+    if tail:
+        total = getattr(mlp, "_solution_mlp_layer_count", total)
+    lookahead = 2 if tail else 1
+    count = reserve if reserve is not None else max(1, total - _partial_count(mlp) - tail)
     with _MODE_LOCK:
         # A resized pool cannot disappear while DMA still touches pinned memory.
         # Query is nonblocking; there is no host synchronization or polling loop.
@@ -293,14 +317,15 @@ def _pool_for(mlp, x, reserve=None, max_rows=None):
             s.leased or (s.has_write and not s.written.query()) or (s.has_read and not s.read.query())
             for s in old.host) or any(s.has_use and not s.used.query() for s in old.staging)]
         pool = _OFFLOAD_POOLS.get(key)
-        if pool is None or pool.capacity < rows or (max_rows is not None and pool.capacity < max_rows):
+        if (pool is None or pool.capacity < rows or (max_rows is not None and pool.capacity < max_rows)
+                or pool.lookahead != lookahead):
             if pool is not None:
                 _RETIRED_POOLS.append(pool)
             # Grow geometrically with packed T, rather than allocating B*S=2048
             # on the first short batch. Explicit preparation remains an upper bound.
             capacity = (max(rows, max_rows) if max_rows is not None
                         else 1 << (max(rows, 1) - 1).bit_length())
-            pool = _OffloadPool(x.device, width, capacity, count)
+            pool = _OffloadPool(x.device, width, capacity, count, lookahead=lookahead)
             _OFFLOAD_POOLS[key] = pool
         else:
             pool.reserve(count)
@@ -321,11 +346,12 @@ def prepare_mlp_offload(model, max_rows=2048):
     groups = {}
     for index, layer in enumerate(layers):
         layer._solution_mlp_layer_index = index
+        layer._solution_mlp_layer_count = len(layers)
         key = (layer.gate_proj.weight.device, layer.gate_proj.out_features)
         groups.setdefault(key, []).append(layer)
     for members in groups.values():
         offloaded = [layer for layer in members if os.environ.get("SOUP_MLP_RECOMPUTE") != "1"
-                     and not _partial_recompute(layer)]
+                     and not _partial_recompute(layer) and not _tail_store(layer)]
         if not offloaded:
             continue
         layer = offloaded[0]
@@ -346,9 +372,13 @@ def _partial_count(mlp):
 
 def _partial_recompute(mlp):
     count = _partial_count(mlp)
-    config = getattr(mlp, "config", None)
     if not count:
         return False
+    return _layer_index(mlp) < count
+
+
+def _layer_index(mlp):
+    config = getattr(mlp, "config", None)
     with _MODE_LOCK:
         if not hasattr(mlp, "_solution_mlp_layer_index"):
             # Real Qwen2 layers share one config and first run in forward depth
@@ -360,7 +390,31 @@ def _partial_recompute(mlp):
             group = _LAYER_ORDERS.setdefault(id(config), weakref.WeakKeyDictionary())
             group[mlp] = len(group)
             mlp._solution_mlp_layer_index = group[mlp]
-        return mlp._solution_mlp_layer_index < count
+        return mlp._solution_mlp_layer_index
+
+
+def _tail_count(mlp):
+    value = os.environ.get("SOUP_EXP_OFFLOAD_TAIL", "0")
+    try:
+        count = int(value)
+    except ValueError:
+        raise ValueError("SOUP_EXP_OFFLOAD_TAIL must be a nonnegative integer") from None
+    if count == 0:
+        return 0
+    total = getattr(mlp, "_solution_mlp_layer_count",
+                    getattr(getattr(mlp, "config", None), "num_hidden_layers", None))
+    if total is None or count < 0 or count > total:
+        raise ValueError("SOUP_EXP_OFFLOAD_TAIL requires 0<=k<=layer count; use prepare_mlp_offload for unknown depth")
+    return count
+
+
+def _tail_store(mlp):
+    count = _tail_count(mlp)
+    if not count:
+        return False
+    total = getattr(mlp, "_solution_mlp_layer_count",
+                    getattr(getattr(mlp, "config", None), "num_hidden_layers", None))
+    return _layer_index(mlp) >= total - count
 
 
 def _eligible(mlp, x):
@@ -418,12 +472,15 @@ def _activation_buffer(gate):
 
 class _FrozenMLP(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, mlp, recompute, offload):
+    def forward(ctx, x, mlp, recompute, offload, tail_store):
         from .kernels.swiglu_fused import swiglu_fused_forward
 
         ctx.mlp, ctx.recompute, ctx.input_dtype = mlp, recompute, x.dtype
         ctx.amp = torch.is_autocast_enabled("cuda")
         ctx.amp_dtype = torch.get_autocast_dtype("cuda")
+        if tail_store:
+            pool = _OFFLOAD_POOLS.get((x.device, mlp.gate_proj.out_features))
+            ctx.tail_previous = pool.last if pool is not None else None
         edge = torch.autograd.graph.get_gradient_edge
         if recompute:
             gate, up = mlp.gate_proj(x), mlp.up_proj(x)
@@ -453,6 +510,11 @@ class _FrozenMLP(torch.autograd.Function):
         from .kernels.swiglu_fused import swiglu_fused_backward
 
         offloaded = getattr(ctx, "offloaded", None)
+        tail_previous = getattr(ctx, "tail_previous", None)
+        if tail_previous is not None:
+            ticket = tail_previous()
+            if ticket is not None:
+                ticket.pool.prefetch_chain(ticket, ticket.pool.lookahead)
         # Verified in torch 2.11 torch/csrc/autograd/init.cpp. Query OUTER task
         # before local autograd.grad(retain_graph=True) creates nested tasks.
         if offloaded is not None:
@@ -484,7 +546,7 @@ class _FrozenMLP(torch.autograd.Function):
             outputs, input_edge = projection_edges
             with torch.autocast(device_type="cuda", enabled=False):
                 dx, = torch.autograd.grad(outputs, input_edge, (dgate, dup), retain_graph=True)
-            return dx.to(ctx.input_dtype), None, None, None
+            return dx.to(ctx.input_dtype), None, None, None, None
         finally:
             if offloaded is not None:
                 offloaded.end_backward(keep_graph)
@@ -499,12 +561,14 @@ def fused_qwen2_mlp(mlp, x, recompute=None, offload=None):
     if offload is None:
         offload = os.environ.get("SOUP_MLP_OFFLOAD") != "0"
     offload = bool(offload) and not recompute
+    tail_store = offload and _tail_store(mlp)
+    offload = offload and not tail_store
     if not torch.is_grad_enabled() or not x.requires_grad:
         from .kernels.swiglu_fused import swiglu_fused_forward
 
         gate, up = mlp.gate_proj(x), mlp.up_proj(x)
         return mlp.down_proj(swiglu_fused_forward(gate, up))
-    return _FrozenMLP.apply(x, mlp, bool(recompute), offload)
+    return _FrozenMLP.apply(x, mlp, bool(recompute), offload, tail_store)
 
 
 def patch_qwen2_mlp_fused():
