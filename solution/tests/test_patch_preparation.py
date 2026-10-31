@@ -22,8 +22,8 @@ def isolated_preparation(monkeypatch):
     yield prep
 
 
-@pytest.mark.parametrize('flag,selected', [(None, False), ('0', False), ('other', False), ('1', True)])
-def test_child_prepares_launchers_only_for_literal_opt_in(monkeypatch, isolated_preparation, flag, selected):
+@pytest.mark.parametrize('flag,selected', [(None, True), ('0', False), ('other', True), ('1', True)])
+def test_child_prepares_launchers_unless_disabled(monkeypatch, isolated_preparation, flag, selected):
     prep = isolated_preparation
     if flag is None:
         monkeypatch.delenv('SOUP_EXP_CPU_LAUNCHERS')

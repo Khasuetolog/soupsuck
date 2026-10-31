@@ -33,7 +33,7 @@ The parent loads these binaries normally on first use. No cache directory is
 created outside the measured run or carried between runs. Non-daemon children
 are joined by multiprocessing at normal parent exit, so their time counts.
 
-EXP-010: SOUP_EXP_CPU_LAUNCHERS=1 also constructs native CPU CudaLauncher
+EXP-010 (default on since A/B 457cf41, -3.33 s; SOUP_EXP_CPU_LAUNCHERS=0 disables) also constructs native CPU CudaLauncher
 objects in the existing process compiler, using each binary's exact source
 and metadata. The constructor builds/imports CPU glue only; it does not access
 CompiledKernel.run/_init_handles or load cubins. CUDA and Triton driver state
@@ -300,7 +300,7 @@ def _process_compile(send, cache_dir):
     try:
         if not cache_dir or os.environ.get('TRITON_CACHE_DIR') != cache_dir:
             raise RuntimeError('Child must inherit the exact run TRITON_CACHE_DIR')
-        if os.environ.get('SOUP_EXP_CPU_LAUNCHERS') == '1':
+        if os.environ.get('SOUP_EXP_CPU_LAUNCHERS', '1') != '0':
             result = _offline_compile(prepare_launchers=True)
             print(f"[solution] EXP-010 CPU launchers prepared={result['launchers_prepared']} "
                   f"binary_s={result['binary_prepare_s']:.4f} "
