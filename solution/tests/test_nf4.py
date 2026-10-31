@@ -11,6 +11,12 @@ import torch.nn.functional as F
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
 
 
+@pytest.fixture(params=["0", "1"], autouse=True)
+def decode_variant(request, monkeypatch):
+    """Both engines must satisfy the existing native-bnb bit oracles."""
+    monkeypatch.setenv("SOUP_EXP_NF4_FAST", request.param)
+
+
 def _original(function):
     while hasattr(function, "_solution_fused_original"):
         function = function._solution_fused_original
@@ -103,7 +109,8 @@ def test_patch_covers_functional_dispatcher_forward_and_backward(native_bnb, mon
     expected_fp4 = bnb.functional.dequantize_4bit(packed_fp4, fp4_state)
     scales = bnb.functional.dequantize_blockwise(state.absmax, state.state2) + state.offset
     calls = []
-    engine = nf4.nf4_decode_kernel
+    engine, _ = nf4._decode_plan(packed)
+    engine_name = "nf4_decode_fast_kernel" if engine is nf4.nf4_decode_fast_kernel else "nf4_decode_kernel"
 
     class LaunchSpy:
         def __getitem__(self, grid):
@@ -112,7 +119,7 @@ def test_patch_covers_functional_dispatcher_forward_and_backward(native_bnb, mon
                 return engine[grid](*args, **kwargs)
             return launch
 
-    monkeypatch.setattr(nf4, "nf4_decode_kernel", LaunchSpy())
+    monkeypatch.setattr(nf4, engine_name, LaunchSpy())
     assert patch_bnb_dequant()
     f, raw, linear = (bnb.functional.dequantize_4bit, backend._dequantize_4bit_impl,
                       backend._dequant_linear_fallback)
@@ -186,6 +193,7 @@ def test_non_nested_functional_forward_and_backward_stay_native(native_bnb, monk
         def __getitem__(self, grid):
             raise AssertionError("non-nested state must never use our NF4 decoder")
     monkeypatch.setattr(nf4, "nf4_decode_kernel", NoLaunch())
+    monkeypatch.setattr(nf4, "nf4_decode_fast_kernel", NoLaunch())
     _assert_bits(bnb.functional.dequantize_4bit(packed, state), expected)
     out = torch.empty_like(expected)
     _assert_bits(bnb.functional.dequantize_4bit(packed, state, out=out), expected)

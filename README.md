@@ -1,43 +1,105 @@
-# Soup Kernel Challenge: less memory for the same LoRA task
+# Soup Kernel Challenge: 1.34× faster and 3.8× less memory, same loss
 
-Our Triton kernels reduce activation and output-head memory during the fixed
-Qwen2.5-1.5B-Instruct NF4/LoRA training task on a Kaggle Tesla T4.
-The latest complete development comparison passed all ten harness checks:
-**73.54 s and 5,863 MiB**, versus **82.25 s and 14,345 MiB** for base Soup.
+Our Triton kernels and runtime patches speed up and slim down the fixed
+Qwen2.5-1.5B-Instruct NF4/LoRA `soup train` task on a Kaggle Tesla T4,
+without changing the task, data, seed, trainer settings or the harness.
+
+Final two-repeat jury comparison (`harness/run_task.py` ×2 + `check_rules.py`)
+on solution commit **`96a890c`**:
 
 | Measurement | Base Soup | Solution | Comparison |
 | --- | ---: | ---: | --- |
-| Whole `soup train` command | 82.25 s | 73.54 s | 1.1184× speedup |
-| Peak GPU memory, sampled by nvidia-smi | 14,345 MiB | 5,863 MiB | 2.4467× base/solution |
-| Public held-out answer-token loss | 2.04960 | 2.04969 | +0.004% vs base |
-| Own Triton kernel share, steps 3 onward | — | 12.1% | Check 4 PASS |
-| Harness checks | — | 10/10 PASS | One paired repetition |
+| Whole `soup train` command, mean of 2 | 87.61 s (91.37 / 83.85) | **65.49 s** (65.11 / 65.87) | **1.338× speedup** |
+| Training loop (64 steps), mean of 2 | 60.75 s | 39.67 s | 1.53× |
+| Median step | 0.94–0.99 s | 0.51–0.52 s | ~1.9× |
+| Peak GPU memory, sampled by nvidia-smi | 14,345 MiB | **3,769 MiB** | **3.806× base/solution** |
+| Public held-out answer-token loss | 2.04966 | 2.04964 | **−0.001 %** vs base |
+| Own Triton kernel share, steps 3 onward | — | 13.3 % (lowest run) | Check 4 PASS |
+| Harness checks | — | **10/10 PASS** | `ALL CHECKS PASSED` |
 
-**Measured commit:** `ce1ff09`, seed 1, 64 training steps on each side.
-These are development results from **one** base/solution pair, not the final
-two-repeat jury comparison. The separate solution suite reported **214 passed,
-4 failed**; check 10 passed all **79** Soup regression tests. Subsequent test
-changes require a new GPU run; all ten checks do not certify the solution suite.
+The submitted commit `f1cb5ac` has `solution/` byte-identical to the measured `96a890c` (`git diff 96a890c f1cb5ac -- solution/` is empty); later commits only touch docs and `tools/`. A confirmation `full2` of `d1bd86f`, which still carried the opt-in EXP-013/015 code, also passed 10/10 (1.283×, 3,769 MiB, +0.004 %) but its solution took 69.21 s against a similar base (88.81 s); since that code bought nothing, we removed it and submit the measured `96a890c` code.
 
-Evidence root, abbreviated **E** throughout this document:
-`runs_kaggle/20261030T112204781815Z_full_ce1ff09/out/`.
-Summary numbers come from `E/runs/result.json:summary`, checks from
-`E/runs/checks.json`, and tests from `E/pytest_solution.log` and check 10.
-`E/source-manifest.json` records commit/archive hashes. These local development
-artifacts are excluded from Git; the final public notebook must publish final
-evidence. The earlier passing `de836e0` pair remains below as history.
+A second `full2` on the submitted `f1cb5ac` itself also passed 10/10: solution 66.64 / 65.14 s, base 89.63 / 84.22 s, **1.319×**, 3,769 MiB (3.806×), eval +0.003 %; solution suite 518 passed, 1 skipped.
 
-- Public Kaggle notebook, saved version: `<KAGGLE_LINK>`
-- Final submission commit: `<FINAL_COMMIT>`
+We also ran `full2` with MLP activations kept on the GPU (`ec92454`, offload off): 10/10, **61.72 s, 1.375×**, but 4,775 MiB (**3.004×**). Under the score formula 35·ln(s)/ln(S) + 30·ln(m)/ln(M) it scores lower than the offload default for any plausible best-team S and M (e.g. S = 1.7, M = 3.806: 45.7 vs 48.3), so we submit the lower-memory configuration. `SOUP_MLP_OFFLOAD=0` reproduces the faster variant.
+
+Correctness on the same T4 stack: **518 passed, 1 skipped** solution tests
+(the skipped one belongs to a rejected opt-in experiment) and **79/79** Soup
+regression tests with `apply()` (check 10).
+
+**Why we report ratios, not only seconds.** Base timing drifts between Kaggle
+sessions (77.7–91.4 s in selected recent sessions with identical base code). The score uses the
+ratio of base to solution inside one session, so every number above comes from
+one session. Whole-run optimization deltas below come from *paired* same-session
+A/B rounds; microbenchmarks, estimates and historical comparisons are labelled separately.
+
+- Public Kaggle notebook, saved version: https://www.kaggle.com/code/khasansueta/notebookf3ae4d2bef
+- Final submission commit: `f1cb5ac32ef7cbd1caf8455c833b67bd43992ed8`
 - Submission links and team: [SUBMISSION.md](SUBMISSION.md)
+
+## Where the time goes
+
+Partial instrumented observation of one solution run on T4
+(`tools/kaggle/start_probe.py`, commit `f81a736`, observer overhead included;
+66.4 s total). The probe records `ok=false` because `import.bitsandbytes` is
+missing from its phase coverage; the intervals below are observations from that
+incomplete probe, not a complete attribution of startup:
+
+| Phase | Seconds | Notes |
+| --- | ---: | --- |
+| Interpreter + imports before `apply()` | 5.1 | torch and early imports; excludes the initial interpreter/probe bootstrap |
+| `apply()` → first training step | 18.7 | further imports including TRL/PEFT, weight load, trainer init; the 4-bit quantization first-to-last event span is 2.2 s, including gaps between events; our Triton compilation runs in a parallel child process here |
+| 64 training steps | 38.3 | first step 3.4 s, median 0.49 s |
+| Adapter save + process exit | 4.1 | |
+
+The first step began 23.97 s after process launch in this instrumented run.
+In the final two-repeat `full2` run on `96a890c`, wall time minus the training
+loop averaged 25.8 s (25.77 / 25.87 s), including startup and shutdown.
+These observed intervals can vary between runs. Displayed phase times are
+rounded; interpreter/probe bootstrap and `apply()` add less than 0.1 s.
+Inside the loop,
+the per-step layer profile (`tools/kaggle/layer_profile.py`) attributes NF4
+weight decoding 83 ms, bitsandbytes/cuBLAS GEMMs ~136 ms, MLP offload waits
+57 ms, SDPA 48 ms, LoRA 30 ms and norms/RoPE 27 ms per step.
+
+Padding (`tools/kaggle/token_stats.py`, exact Soup/TRL pipeline, seed 1):
+64 batches of 4 rows contain 52,890 real tokens out of 91,856 padded positions
+(**42.4 % padding**); only 33,608 positions carry labels. The unpadded decoder
+skips all 42.4 %, and the head backward skips 63.4 % of positions.
 
 ## What we did
 
 The entry point is [`solution.apply()`](solution/__init__.py).
-Registration below describes committed HEAD `585de28`. Compared with the measured
-`ce1ff09`, HEAD also registers lossless tied-embedding storage and fused RoPE.
-Their performance and GPU correctness are **not** established by the ce1ff09
-results. No result in this document is presented as a final-HEAD comparison.
+Everything below is registered in the measured commit `96a890c`.
+
+### Padding-free decoder within each batch
+
+[`solution/unpad.py`](solution/unpad.py) runs the Qwen2 decoder on the packed
+`[1, T, H]` tensor of real tokens of one batch (right padding removed); rows of
+different batches are never mixed. Attention runs per row through SDPA with the
+original causal semantics, RoPE receives the original per-row positions, and the
+result is scattered back to `[B, S, H]` so TRL/Rewind labels, shift and masks are
+untouched. There is one device-to-host synchronization per batch
+(`metadata.tolist()`); LoRA dropout sees the same padded-shape input so its RNG
+stream is unchanged. Validated against a full fp64 Qwen2+LoRA oracle.
+`SOUP_UNPAD=0` disables it.
+
+### Asynchronous MLP activation offload
+
+[`solution/mlp.py`](solution/mlp.py) saves each layer's fp16 gate/up tensors to
+pinned host memory on a side CUDA stream during forward and prefetches them back
+one layer ahead during backward, guarded by CUDA events and `record_stream`
+(no host synchronization). This is what lets the peak fall to 3,769 MiB without
+recomputing the 8960-wide projections. `SOUP_MLP_OFFLOAD=0` keeps them on GPU.
+
+### Out-of-process Triton compilation and prebuilt launchers
+
+[`solution/precompile.py`](solution/precompile.py) compiles every production
+kernel specialization in a child process while the parent imports libraries and
+loads the model, and (EXP-010) also builds the native CPU launchers there, so the
+first training step does not pay JIT cost (first step 6.5 → 2.9 s). Results go to
+the run's own `TRITON_CACHE_DIR`; no cache is reused across runs.
+`SOUP_EXP_PRECOMPILE=0` / `SOUP_EXP_CPU_LAUNCHERS=0` disable it.
 
 ### Frozen linear cross-entropy, entropy and predictions
 
@@ -89,8 +151,7 @@ fp16 for GEMM, accumulates dX in fp32, and multiplies by
 underflow; it does not promise bitwise equality with baseline fp16 dZ.
 The frozen head has no weight gradient. Excluding ignored rows before gain
 computation removes the reviewed ignored-row `0 * inf` gradient path in 8f8ebbc;
-the ce1ff09 paired checks pass, while the dedicated edge-case tests must also
-be checked in the final suite. Zero-denominator training loss retains baseline
+dedicated edge-case tests pass on T4 in the final suite. Zero-denominator training loss retains baseline
 NaN semantics.
 
 ### Qwen2 RMSNorm
@@ -198,8 +259,9 @@ context during backward. It adds projection work in exchange for lower retained
 activation memory. Local GradientEdges preserve projection backward without
 retaining the entire activation buffer as a tensor leaf. Frozen, supported
 projection types qualify; trainable projections, hooks and wrappers fall back.
-Only first-order gradients are implemented. Recompute was not used for the summary result. Its separate paired measurement
-is reported below; store remains the default.
+Only first-order gradients are implemented. Recompute is off by default; the
+default keeps fp16 gate/up and offloads them to host memory as described under
+[asynchronous MLP activation offload](#asynchronous-mlp-activation-offload).
 
 ### NF4 decoder
 
@@ -207,7 +269,7 @@ is reported below; store remains the default.
 **Registered:** [`solution/nf4_patch.py`](solution/nf4_patch.py) patches the
 bitsandbytes functional and CUDA backend dequantization paths after their
 post-import dependencies are ready. The exact bitsandbytes version gate is
-0.50.2. NF4 was active in measured ce1ff09 and contributes to its own-kernel share.
+0.50.2. NF4 decoding is the largest own kernel in the final run (7.0 % share).
 The 4-bit matrix multiplication itself remains a library operation.
 
 The supported nested format is fp16 NF4, block size 64, with double-quantized
@@ -233,8 +295,8 @@ No new Triton kernel is introduced.
 Only the table's storage becomes half. Embedding lookup is restored to the
 original fp32 output; the dense head uses the same represented weights under
 AMP. Outside AMP it temporarily reconstructs fp32 weights, so this optimization
-does not promise lower eval peak memory. It was registered after ce1ff09:
-no separate measured memory or speed gain is claimed here.
+does not promise lower eval peak memory. It is active in the final
+run; no separately isolated memory or speed gain is claimed.
 
 ### Fused q/k rotary position embedding
 
@@ -251,8 +313,7 @@ matching the original graph. Only cos/sin and metadata are saved.
 The fast path supports even head dimensions, supported CUDA fp16/fp32 tensors,
 `unsqueeze_dim=1` and non-trainable cos/sin. Other cases use plain PyTorch math;
 no optional hub kernel is requested or called, including on fallback.
-Sequence size is a runtime argument. RoPE was added after ce1ff09 and has no
-measured share in that run; final GPU tests and profiling remain required.
+Sequence size is a runtime argument. Measured share in the final run: 0.92 %.
 
 ## How it plugs in
 
@@ -296,13 +357,16 @@ are used by this implementation.
 1. Use the repository assigned by the hackathon platform. Import
    [`templates/kaggle_notebook.ipynb`](templates/kaggle_notebook.ipynb) into Kaggle.
 2. Select **GPU T4 x2**, enable Internet, and set `REPO_URL` to the repository
-   URL and `COMMIT` to `<FINAL_COMMIT>`. The harness uses one GPU. For a private
+   URL and `COMMIT` to `f1cb5ac32ef7cbd1caf8455c833b67bd43992ed8`. The harness uses one GPU. For a private
    repository, configure the read-only `GITHUB_TOKEN` Kaggle secret as the
    template describes.
-3. Run all cells. For the final comparison, use
-   `python harness/run_task.py --repeats 2` in the training cell, then run the
-   unchanged checks and score cells. This runs base, solution, solution, base.
-4. Save the completed notebook version, publish it, and replace `<KAGGLE_LINK>`
+3. Run all cells with the template unchanged. Its training cell runs
+   `python harness/run_task.py`: one base and one solution run, followed by the
+   checks and score cells. The saved public notebook uses this one-repeat
+   procedure. The two-repeat evidence reported above comes from a separate
+   development `full2` run (base, solution, solution, base), reproducible with
+   the local commands or development runner below.
+4. Save the completed notebook version, publish it, and put its link
    here and in SUBMISSION with the same saved-version link. Preserve result,
    checks, metrics and logs with that notebook.
 
@@ -324,7 +388,9 @@ python harness/score.py runs/result.json
 
 The measured runtime was Python 3.13.15, torch 2.11.0+cu128, Triton 3.6.0 and
 Tesla T4 driver 580.178.04, with the package versions above; source:
-`E/runs/result.json:versions`. The head's backward relies on CUDA `torch.mm` support for
+`versions` in `runs/result.json` within the `full2` evidence directory listed
+under [Results and kernel-time accounting](#results-and-kernel-time-accounting).
+The head's backward relies on CUDA `torch.mm` support for
 `out_dtype=torch.float32`; its forward logits use fp16 GEMM output. A different runtime must be validated.
 The harness sets the allocator and restricts training to one GPU; do not
 substitute a different allocator or prepopulate compiler caches.
@@ -352,88 +418,61 @@ This private iteration notebook does not replace the public submission link.
 
 ## Results and kernel-time accounting
 
-The latest passing pair is **one repeat at ce1ff09**. Base metrics report a
-57.51 s training loop and 0.9107 s median step; solution reports 51.52 s and
-0.6868 s. Whole-command timing includes startup, cold compilation and saving.
+Final jury comparison: `96a890c`, two base and two solution repetitions in one
+T4 session, `check_rules.py` 10/10 (evidence:
+`runs_kaggle/20261031T133425573730Z_full2_96a890c_promote010/out/`, local, not
+in Git). Shares are `100 * own_kernel_ms / (1000 * timed_loop_s)` for steps
+3–64 of each solution run (timed loop 35.37 s and 35.99 s).
 
-| Passing development pair | Base / solution wall, s | Base / solution peak, MiB | Base / solution eval loss | Speedup / memory ratio | Own share | Checks |
-| --- | --- | --- | --- | --- | --- | --- |
-| de836e0 (history) | 77.47 / 70.05 | 14,345 / 5,843 | 2.04964 / 2.04962 | 1.1059 / 2.4551 | 8.6% | 10/10 |
-| ce1ff09 (latest) | 82.25 / 73.54 | 14,345 / 5,863 | 2.04960 / 2.04969 | 1.1184 / 2.4467 | 12.1% | 10/10 |
+| Kernel | Run 1, ms | Run 1 share | Run 2 share |
+| --- | ---: | ---: | ---: |
+| `nf4_decode_kernel` | 2496.4 | 7.06 % | 6.97 % |
+| `swiglu_tile_engine` | 913.1 | 2.58 % | 2.54 % |
+| `lora_scale_add_kernel` | 189.8 | 0.54 % | 0.54 % |
+| `add_rmsnorm_forward_kernel` | 187.6 | 0.53 % | 0.52 % |
+| `rope_pair_forward_kernel` | 167.9 | 0.47 % | 0.47 % |
+| `rope_pair_backward_kernel` | 158.0 | 0.45 % | 0.45 % |
+| `add_rmsnorm_backward_kernel` | 150.7 | 0.43 % | 0.42 % |
+| `vocabulary_statistics_kernel` | 130.4 | 0.37 % | 0.37 % |
+| `vocabulary_derivative_kernel` | 108.8 | 0.31 % | 0.30 % |
+| `rmsnorm_input_gradient_kernel` | 108.1 | 0.31 % | 0.30 % |
+| `rmsnorm_forward_kernel` | 81.1 | 0.23 % | 0.23 % |
+| `lora_scale_gradient_kernel` | 75.7 | 0.21 % | 0.21 % |
+| `vocabulary_outputs_kernel` | 0.5 | 0.00 % | 0.00 % |
+| **Total counted own kernels** | **4768.0** | **13.5 %** | **13.3 %** |
 
-Historical evidence:
-`runs_kaggle/20261030T105526661826Z_full_de836e0/out/runs/result.json`.
-These pairs ran on different sessions; their difference is not an isolated
-measurement of any single optimization.
+The total uses unrounded timings; individual rows are rounded independently.
+No `example_*`, cuBLAS or library kernel time is counted.
 
-Shares below are training-time shares, not percentages of GPU kernel time or
-whole-command shares. Timed solution steps 3–64 total **43.035 s**.
-Each share is `100 * own_kernel_ms[name] / (1000 * timed_loop_s)` from
-`E/runs/solution_1/metrics.json`. Base has no own kernels.
+### Optimization history
 
-| Kernel | CUDA-event time, ms | Share of timed training |
-| --- | ---: | ---: |
-| `rmsnorm_forward_kernel` | 119.613 | 0.2779% |
-| `rmsnorm_input_gradient_kernel` | 165.313 | 0.3841% |
-| `add_rmsnorm_forward_kernel` | 222.172 | 0.5163% |
-| `add_rmsnorm_backward_kernel` | 254.163 | 0.5906% |
-| `lora_scale_add_kernel` | 148.014 | 0.3439% |
-| `lora_scale_gradient_kernel` | 84.083 | 0.1954% |
-| `vocabulary_statistics_kernel` | 262.717 | 0.6105% |
-| `vocabulary_outputs_kernel` | 0.725 | 0.0017% |
-| `vocabulary_derivative_kernel` | 112.667 | 0.2618% |
-| `swiglu_tile_engine` | 1709.047 | 3.9713% |
-| `nf4_decode_kernel` | 2148.202 | 4.9918% |
-| **Total counted own kernels** | **5226.716** | **12.1453%** |
+For whole-run A/B experiments, A = the default at the time and candidates use
+opt-in flags, alternating order over rounds (`tools/kaggle/registry.py`, median
+of paired differences, 95 % bootstrap CI). Current promotion requires paired
+wall time not slower and peak memory not higher, preserved eval loss, then
+`full2` + `check_rules`. Historical adoption decisions and other evidence types
+are recorded explicitly below.
 
-Frozen norm weights mean the two optional norm-weight-gradient kernels are
-absent. RoPE and tied-embedding storage were not registered in ce1ff09; they
-receive no measured credit here. No `example_*`, cuBLAS or other library kernel
-time is counted. Check 4 rounds to 12.1%; final scoring uses the lowest eligible
-share across solution repetitions.
+| Change | Δ wall, s (95 % CI) | Δ peak, MiB | Decision |
+| --- | --- | ---: | --- |
+| Out-of-process Triton precompile + launch trim (EXP-001/004) | −1.80 [−5.96, −1.60]; 3 pairs, `d5dc84b` | +4 (3,765 → 3,769) | historical default adoption |
+| Prebuilt native CPU launchers in the compile child (EXP-010) | **−3.33 [−3.66, −2.86]**; first step 6.53 → 2.93 s | 0 | **default (`96a890c`)** |
+| Parent launcher warm-up (EXP-013) | −0.85 [−1.06, −0.15]; first step −0.91 s (4 rounds, `caad3ea`) | 0 | not adopted: its own T4 acceptance test failed |
+| High-priority offload copy streams (EXP-015) | −0.25 [−0.50, +0.30] | 0 | not adopted (noise) |
+| Keep MLP gate/up on GPU, no offload (`SOUP_MLP_OFFLOAD=0`) | −5.76 [−5.97, −5.27] (4 rounds, `caad3ea`) | **+1,006** (4,775) | rejected: memory ratio 3.81× → 3.00× outweighs 1.10× faster under the score formula with a conservative best-team speed |
+| Faster packed NF4 decode kernel (EXP-006) | −0.06 [−0.53, +0.25] | 0 | not adopted (noise) |
+| Single autograd boundary for the LoRA pair (EXP-008) | +0.25 [−0.62, +0.55] | 0 | rejected |
+| Offload gate + input, recompute up (EXP-009) | +2.06 [+0.97, +2.38] | −82 | rejected: slower |
+| Keep last k MLPs on GPU (EXP-007) | not measured | estimated +70·k | not adopted: estimated memory increase |
+| Own NF4×fp16 Triton GEMM (EXP-002) | microbenchmark: 4–66× slower than decode + cuBLAS per GEMM | — | rejected |
+| Launch-config sweep, bit-identical outputs (EXP-011) | microbenchmark: ≤ 6.5 % per kernel; estimated < 0.2 s/run | not measured | not adopted |
 
-### Precision and memory experiments
-
-| Snapshot / setting | Solution wall, s | Peak, MiB | Median step, s | Eval loss |
-| --- | ---: | ---: | ---: | ---: |
-| 0e12e01, original post-attention norm dtype | 89.81 | 8,003 | 0.8215 | 2.04967 |
-| 0e12e01, `SOUP_FUSED_NORM_FP16=1` | 76.64 | 5,843 | 0.7188 | 2.04966 |
-
-Evidence directories under `runs_kaggle/`:
-`20261030T104335675818Z_solution_0e12e01_default/out/` and
-`20261030T104354956814Z_solution_0e12e01_e4e1167_fp16norm/out/`
-(`runs_try/result.json` and `solution_1/metrics.json`). These solution-only
-experiments motivated the post-attention half default; they do not isolate
-later input/final norm compression or prove exact LoRA equivalence.
-
-| MLP experiment | Solution wall / loop, s | Peak, MiB | Eval loss | Paired speedup / memory ratio |
-| --- | --- | ---: | ---: | --- |
-| 8f8ebbc store | 79.57 / 47.05 | 5,843 | 2.04966 | Solution only |
-| 8f8ebbc recompute | 86.39 / 53.63 | 4,143 | 2.04966 | Solution only |
-| ce1ff09 store (default) | 73.54 / 51.52 | 5,863 | 2.04969 | 1.1184 / 2.4467 |
-| ce1ff09 recompute | 93.95 / 67.82 | 4,123 | 2.04968 | 1.0404 / 3.4793 |
-
-8f8ebbc evidence: `runs_kaggle/20261030T111238818312Z_solution_8f8ebbc_store/out/`
-and `20261030T111258418092Z_solution_8f8ebbc_eb596ed_recompute/out/`.
-Recompute paired evidence:
-`runs_kaggle/20261030T112337362378Z_full_ce1ff09_eb596ed_recompute/out/runs/result.json`.
-Its base was 97.75 s, 14,345 MiB, eval loss 2.04964; all ten checks passed and
-own share was 10.6%. The extra projection work reduces memory but its speedup
-is below the score's 1.05 threshold. **Store remains the default.** Separate
-sessions have different base timings; memory and speed ratios use each pair's
-own base rather than mixing sessions.
-
-| Final two-repeat comparison | Value |
-| --- | --- |
-| Commit / saved public notebook | `<FINAL_COMMIT>` / `<KAGGLE_LINK>` |
-| Base / solution wall time | `<FINAL_BASE_TIME>` / `<FINAL_SOLUTION_TIME>` |
-| Base / solution peak memory | `<FINAL_BASE_MEMORY>` / `<FINAL_SOLUTION_MEMORY>` |
-| Base / solution eval loss | `<FINAL_BASE_LOSS>` / `<FINAL_SOLUTION_LOSS>` |
-| Lowest own-kernel share / all ten checks | `<FINAL_KERNEL_SHARE>` / `<FINAL_CHECKS>` |
-
-These placeholders are deliberately unfilled: the final two-repeat result is
-not the measured one-repeat result. Score points depend on other admitted teams;
-we report measured ratios rather than claiming a leaderboard score.
+Memory is a separate decision: MLP gate/up offload to pinned host memory and
+the fp16 norm/head paths are what bring the peak from 14,345 to 3,769 MiB.
+Historically, full MLP recomputation reached 4,123 MiB at `ce1ff09`; its
+93.95 s wall time versus 73.54 s for store mode was about +20 s across separate
+Kaggle sessions. This is a historical cross-session observation, not a paired
+estimate of its cost. The current default is asynchronous offload.
 
 ## Limitations and review status
 
@@ -447,28 +486,22 @@ operations; only rotary position application and NF4 decoding are replaced.
 Chunked CE still performs library GEMMs and Python chunk iteration. Cold
 compilation and setup count toward wall time. Lossless embedding conversion
 requires an exact half roundtrip and may decline on another checkpoint.
-RoPE and embedding registration postdate the latest full comparison.
 
 [Independent review](tasks/REVIEW.md) contains S-017, S-021 and S-023:
 
 | Finding | Current status / evidence boundary |
 | --- | --- |
-| P0-1: own share below 5% | Both de836e0 and ce1ff09 full pairs pass check 4; ce1ff09 is 12.1%. Final two-repeat evidence remains pending. |
-| P1-1: all-ignored/nonfinite upstream can produce NaN dX | Closed in code by S-018: backward exits before gain/GEMMs if no valid targets and excludes ignored rows otherwise. S-021 confirms the structure; final dedicated tests still required. |
+| P0-1: own share below 5% | Final two-repeat `96a890c` passes check 4 at 13.3 % (lowest run). |
+| P1-1: all-ignored/nonfinite upstream can produce NaN dX | Closed in code by S-018: backward exits before gain/GEMMs if no valid targets and excludes ignored rows otherwise. S-021 confirms the structure; dedicated tests pass on T4. |
 | P1-2: half norm reaches dense fp32 MLP outside AMP | Closed statically in S-016/S-023 by consumer guards; unsupported MLP keeps the promoted dtype. |
-| P1-023-1: input-norm half changes LoRA values and shared-gradient accumulation | Numerical limitation remains. ce1ff09 checks 5–7 pass for one public pair; this does not prove equality or hidden-row/seed robustness. Dropout masks/RNG alone do not establish numerical equivalence. |
+| P1-023-1: input-norm half changes LoRA values and shared-gradient accumulation | Numerical limitation remains. `96a890c` checks 5–7 pass on two repeats (first-step loss 0.02 %, mean 0.01 %); this does not prove equality or hidden-row/seed robustness. Dropout masks/RNG alone do not establish numerical equivalence. |
 | P2-021-1: functional NF4 `out=` allocation/copy | Remains a performance limitation; alias result is preserved. |
 | P2-021-2: functional non-nested NF4 can reach own flat backend | Documented routing; unsupported-format fallback does not mean all non-nested calls avoid our kernel. |
 | P2-021-3: chunk CE equality test is not whole-head bitwise proof | Remains a test-scope limitation. cuBLAS algorithms can differ with GEMM shape. |
-| P2-1: description/reproducibility | Updated here; final links, final commit and two-repeat result remain pending. |
+| P2-1: description/reproducibility | Updated with the final two-repeat result; public notebook link pending. |
 
-The ce1ff09 solution suite had four failures: a stale fake-MLP dtype expectation,
-an input/final half-norm gradient comparison, and two strict random half-store
-RMSNorm comparisons. Subsequent test changes at 585de28 distinguish the guarded
-fallback, rounding-boundary behavior and contraction tolerances. They are not a
-new passing GPU log. Require a fresh complete solution suite and paired run of
-the final commit before submission. Unpadding (S-024) and MLP offload (S-025)
-are in progress and are not claimed as accepted features or measured gains.
+The final solution suite on T4 (`96a890c`): 518 passed, 1 skipped, 0 failed;
+Soup regression tests 79/79 with `apply()`.
 
 ## Challenge rules retained
 
@@ -483,7 +516,7 @@ these reported artifacts do not modify its measurement code.
 | `harness/` | Timing, sampled memory, evaluator, checks and scoring |
 | `tests/` | Soup regression tests |
 | Trainer settings and Soup outputs | Same adapter parameters/shapes, metrics, token counts and Rewind rows/losses within allowed tolerances |
-| Measurement environment | One T4 GPU, harness allocator, no background GPU work, warm compiler cache or measurement-dependent behavior |
+| Measurement environment | One T4 GPU, harness allocator; no background GPU work; no warm compiler cache; no measurement-dependent behavior |
 
 The task uses 256 public training rows, batch size 4 and maximum length 512,
 one epoch with LoRA r=16, alpha=32 and the unchanged Soup dropout/target defaults;

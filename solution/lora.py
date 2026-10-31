@@ -152,7 +152,13 @@ def _patch_class(cls, variant_kwarg_keys):
         requires_conversion = not torch.is_autocast_enabled("cuda")
         if requires_conversion:
             lora_input = self._cast_input_dtype(lora_input, a.weight.dtype)
-        lora_out = b(a(self.lora_dropout[adapter](lora_input)))
+        dropped = self.lora_dropout[adapter](lora_input)
+        if os.environ.get("SOUP_EXP_LORA_PAIR") == "1":
+            from .lora_pair import eligible, linear_pair
+
+            lora_out = linear_pair(dropped, a, b) if eligible(dropped, a, b) else b(a(dropped))
+        else:
+            lora_out = b(a(dropped))
         return lora_epilogue(result, lora_out, self.scaling[adapter],
                              cast_to_result=requires_conversion)
 

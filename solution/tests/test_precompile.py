@@ -13,6 +13,8 @@ import pytest
 @pytest.fixture(autouse=True)
 def explicit_legacy_environment(monkeypatch):
     monkeypatch.setenv('SOUP_EXP_PRECOMPILE', '0')
+    monkeypatch.setenv('SOUP_EXP_CPU_LAUNCHERS', '0')
+    monkeypatch.setenv('SOUP_EXP_NF4_FAST', '0')
     monkeypatch.setenv('SOUP_EXP_LAUNCH_TRIM', '0')
 
 
@@ -30,9 +32,11 @@ assert not any(n in sys.modules for n in
                    cwd=Path(__file__).resolve().parents[2])
 
 
-def test_plans_cover_production_kernels_and_bind_real_signatures():
+@pytest.mark.parametrize('fast', [False, True])
+def test_plans_cover_production_kernels_and_bind_real_signatures(monkeypatch, fast):
     from solution.precompile import plans
 
+    monkeypatch.setenv('SOUP_EXP_NF4_FAST', '1' if fast else '0')
     found = set()
     root = Path(__file__).resolve().parents[2]
     expected = set()
@@ -44,7 +48,8 @@ def test_plans_cover_production_kernels_and_bind_real_signatures():
         for node in ast.parse(file.read_text()).body:
             if isinstance(node, ast.FunctionDef) and any(
                     isinstance(d, ast.Attribute) and d.attr == 'jit' for d in node.decorator_list):
-                expected.add(node.name)
+                if node.name != 'nf4_decode_fast_kernel' or fast:
+                    expected.add(node.name)
     for plan in plans():
         tree = ast.parse((root / (plan.module.replace('.', '/') + '.py')).read_text())
         fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == plan.kernel)
@@ -53,16 +58,18 @@ def test_plans_cover_production_kernels_and_bind_real_signatures():
         assert len(plan.args) <= len(names)
         assert set(names[len(plan.args):]) == set(plan.options).intersection(names)
         assert not set(names[:len(plan.args)]).intersection(plan.options)
-        assert plan.options.get('num_warps', 4) == 4
+        assert plan.options.get('num_warps', 4) == (8 if plan.kernel == 'nf4_decode_fast_kernel' else 4)
         found.add(plan.kernel)
     assert found == expected
     assert any(p.kernel == 'vocabulary_statistics_kernel' and p.args[4] == 384
                and p.args[-1] == 512 for p in plans())
 
 
-def test_compiler_options_match_production_presence_and_insertion_order():
+@pytest.mark.parametrize('fast', [False, True])
+def test_compiler_options_match_production_presence_and_insertion_order(monkeypatch, fast):
     from solution.precompile import plans
 
+    monkeypatch.setenv('SOUP_EXP_NF4_FAST', '1' if fast else '0')
     for plan in plans():
         keys = tuple(k for k in plan.options if k in ('num_warps', 'enable_fp_fusion'))
         if plan.kernel == 'vocabulary_statistics_kernel':
@@ -73,6 +80,21 @@ def test_compiler_options_match_production_presence_and_insertion_order():
             assert keys == ('enable_fp_fusion',)  # implicit backend warp default
         else:
             assert keys == ('num_warps', 'enable_fp_fusion')
+
+
+def test_fast_nf4_preparation_is_opt_in_and_keeps_baseline_descriptors(monkeypatch):
+    from solution.precompile import plans, _launcher_options
+
+    baseline = plans()
+    monkeypatch.setenv('SOUP_EXP_NF4_FAST', '1')
+    candidate = plans()
+    added = [p for p in candidate if p.kernel == 'nf4_decode_fast_kernel']
+    assert [p for p in candidate if p.kernel != 'nf4_decode_fast_kernel'] == baseline
+    assert len(added) == 2
+    assert {p.args[-2:] for p in added} == {(False, 4096), (True, 4096)}
+    assert all(p.options == dict(num_warps=8, enable_fp_fusion=False) for p in added)
+    assert _launcher_options('nf4', 'nf4_decode_kernel') == (('num_warps', 4), ('enable_fp_fusion', False))
+    assert _launcher_options('nf4', 'nf4_decode_fast_kernel') == (('num_warps', 8), ('enable_fp_fusion', False))
 
 
 def test_thread_mode_and_literal_zero_opt_out_are_idempotent(monkeypatch):
@@ -217,8 +239,12 @@ def test_pinned_pairs_are_consumed_once_with_original_shape_policy(monkeypatch):
     assert fake._HostSlot(4096, 1000).gate.shape == (4096, 1000)
 
 
-@pytest.mark.parametrize('mode', ['1', 'process'], ids=['thread', 'spawn-disk-cache'])
-def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch, tmp_path, mode):
+@pytest.mark.parametrize('mode,cpu_launchers,fast',
+                         [('1', False, False), ('process', False, False), ('process', True, False),
+                          ('process', False, True), ('process', True, True)],
+                         ids=['thread', 'spawn-disk-cache', 'spawn-cpu-launchers',
+                              'spawn-fast-nf4', 'spawn-fast-nf4-cpu-launchers'])
+def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch, tmp_path, mode, cpu_launchers, fast):
     torch = pytest.importorskip('torch')
     if not torch.cuda.is_available():
         pytest.skip('CUDA required')
@@ -235,6 +261,8 @@ def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch, tmp_path, 
     from solution.kernels.rope import fused_rope
 
     monkeypatch.setenv('SOUP_EXP_PRECOMPILE', mode)
+    monkeypatch.setenv('SOUP_EXP_CPU_LAUNCHERS', '1' if cpu_launchers else '0')
+    monkeypatch.setenv('SOUP_EXP_NF4_FAST', '1' if fast else '0')
     monkeypatch.setenv('SOUP_MLP_OFFLOAD', '0')
     monkeypatch.setattr(prep, '_STATE', dict(started=False, compiled=0, pinned_pairs=0,
                                           errors=[], finished=[]))
@@ -252,6 +280,7 @@ def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch, tmp_path, 
         monkeypatch.setattr(triton.knobs.cache, 'dir', str(cache_dir))
         for kernel in kernels.values():
             kernel.device_caches[device][0].clear()
+    before_allocated = torch.cuda.memory_allocated()
     assert prep.start()
     state = prep.wait(180)
     assert not state['alive'] and not state['errors'], state
@@ -260,9 +289,24 @@ def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch, tmp_path, 
         assert state['process_exitcode'] == 0, state
         assert state['child_cuda_initialized'] is False, state
         assert state['child_driver_touched'] is False, state
+        if cpu_launchers:
+            assert state['launchers_prepared'] == len(prep.plans()), state
+            assert state['launcher_prepare_s'] >= 0, state
+            assert torch.cuda.memory_allocated() == before_allocated
+            assert all(not k.device_caches[device][0] for k in kernels.values())
     seen = set()
     disk_hits, compilation_misses = set(), []
     active = [True]
+    native_misses = []
+    if cpu_launchers:
+        from triton.runtime import build as native_build
+
+        original_build = native_build._build
+        def count_native_build(name, *args, **kwargs):
+            if active[0] and name == '__triton_launcher':
+                native_misses.append(name)
+            return original_build(name, *args, **kwargs)
+        monkeypatch.setattr(native_build, '_build', count_native_build)
     touched = set()
     case_name = ['']
     previous_listener = triton.knobs.compilation.listener
@@ -406,10 +450,18 @@ def test_warmup_real_kernel_cache_hits_and_exact_outputs(monkeypatch, tmp_path, 
             out = torch.empty(shape, device='cuda', dtype=torch.float16)
             return nested, _dequantize_flat_into(packed, flat, out)
         compare(f'NF4/{shape}/nested+flat', nf4_run)
+        if fast:
+            # Baseline descriptors remain available for normal decode/fallback;
+            # exercise both independently named JITs with aligned pointers.
+            with monkeypatch.context() as patch:
+                patch.setenv('SOUP_EXP_NF4_FAST', '0')
+                compare(f'NF4/{shape}/baseline-nested+flat', nf4_run)
     assert seen == set(kernels)
     if mode == 'process':
         assert not compilation_misses
         assert disk_hits == set(kernels), 'every kernel must load a child-built disk artifact'
+        if cpu_launchers:
+            assert not native_misses, 'production launch rebuilt a child-prepared CPU launcher'
 
 
 def test_prepared_pinned_storage_preserves_offload_outputs_and_gradients(monkeypatch):

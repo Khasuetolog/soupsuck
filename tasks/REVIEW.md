@@ -14,7 +14,7 @@ STATUS, RUNTIME_AUDIT, все Python-файлы solution в проверенно
 result/metrics/profile и pytest-логи предыдущих T4-прогонов.
 
 `site/` ниже обозначает реально прочитанные pinned-исходники в
-`/private/tmp/claude-501/-Users-arystan-orca-workspaces-decentrathon-6-0-featherduster/c29b337b-6a21-4aad-b075-87130cee4abf/scratchpad/src/site/`.
+`<scratch>`.
 Пакетов bitsandbytes и torch в этом каталоге нет; их реализацию этим чтением
 независимо не подтверждали. Сведения о bnb из предыдущего RUNTIME_AUDIT отмечены
 как зависимость, а не новое измерение.
@@ -320,12 +320,12 @@ S-017 P1-1 закрыт структурой CE backward на уровне ко�
 `bitsandbytes-0.50.2-py3-none-manylinux_2_24_x86_64.whl`.
 SHA256 файла сверен с JSON PyPI:
 `55348a9a4a21bfd99cf8c7b32fe67b4030ae5c2a05738e03c1747f65fa6ec283`.
-Извлечены только Python-исходники в `/private/tmp/s021-bnb-0.50.2/`:
+Извлечены только Python-исходники в `<tmp>/s021-bnb-0.50.2/`:
 `bitsandbytes/functional.py`, `backends/cuda/ops.py`, `autograd/_functions.py`,
 `nn/modules.py`. Далее **bnb/** обозначает этот каталог bitsandbytes.
 
 Дополнительно прочитан [csrc/kernels.cu тега 0.50.2](https://github.com/bitsandbytes-foundation/bitsandbytes/blob/0.50.2/csrc/kernels.cu),
-сохранённый в `/private/tmp/s021-bnb-kernels.cu`, SHA256
+сохранённый в `<tmp>/s021-bnb-kernels.cu`, SHA256
 `a88d7a522b21b3d6e50cacad890c0c3ac44ad17b5f205c4b34ae91995ba1e5d6`.
 Номера строк ниже взяты из скачанных файлов, а solution — из `git show <commit>:<path>`.
 Python urllib первоначально не прошёл локальную проверку сертификата; штатный
@@ -758,7 +758,7 @@ fp16 input norm из P1-023-1 остаётся. Найдены P2 по стои�
 ### Источники и воспроизводимость
 
 Здесь `SITE` означает локальный pinned source root:
-`/private/tmp/claude-501/-Users-arystan-orca-workspaces-decentrathon-6-0-featherduster/c29b337b-6a21-4aad-b075-87130cee4abf/scratchpad/src/site`.
+`<scratch>`.
 Ссылки на строки `solution/*` ниже относятся **к `git show 2004b33:<path>`**,
 а не к меняющемуся checkout; ссылки RoPE также совпадают с `585de28`.
 
@@ -777,7 +777,7 @@ fp16 input norm из P1-023-1 остаётся. Найдены P2 по стои�
 в нём выполнено:
 
 ```text
-/private/tmp/s004-integration-venv/bin/python -m pytest solution/tests/test_unpad.py -q -rs
+<tmp>/s004-integration-venv/bin/python -m pytest solution/tests/test_unpad.py -q -rs
 16 passed, 15 skipped in 0.17s
 ```
 
@@ -987,7 +987,7 @@ Default store математически не изменён; оба новых 
 - Снимок: `git show 796bf0e:solution/mlp.py`, `:solution/tests/test_mlp.py`,
   `:solution/kernels/swiglu_fused.py:67-78`; diff относительно родителя.
 - Локальная копия torch 2.11 `torch/csrc/autograd/init.cpp:516-518`
-  (`/private/tmp/featherduster-torch-autograd-init.cpp`) подтверждает binding
+  (`<tmp>/featherduster-torch-autograd-init.cpp`) подтверждает binding
   `_get_current_graph_task_keep_graph` в `torch._C._autograd`.
 - [PyTorch 2.11 CUDA stream semantics](https://docs.pytorch.org/docs/2.11/notes/cuda.html#cuda-streams)
   и [Tensor.record_stream](https://docs.pytorch.org/docs/2.11/generated/torch.Tensor.record_stream.html):
@@ -1001,7 +1001,7 @@ Python syntax compilation обоих review-target файлов прошла б�
 Команда в этом каталоге:
 
 ```text
-/private/tmp/s004-integration-venv/bin/python -m pytest solution/tests/test_mlp.py -q -rs
+<tmp>/s004-integration-venv/bin/python -m pytest solution/tests/test_mlp.py -q -rs
 SKIPPED solution/tests/test_mlp.py:8: No module named 'torch'
 1 skipped in 0.08s; exit code 5 (нет собранных исполнимых тестов)
 ```
